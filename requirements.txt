@@ -1,0 +1,5 @@
+# Runtime dependencies
+pystray>=0.19
+Pillow>=10
+
+# Build-time only (to produce the .exe): pip install pyinstaller

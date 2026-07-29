@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+
+# PyInstaller build output
+build/
+dist/
+*.spec
+
+# Binaries (shipped via GitHub Releases, not committed)
+*.exe
+
+# Secrets & local data — config lives in %APPDATA%\EcoFlowTray, never in the repo
+config.json
+quota_*.json
