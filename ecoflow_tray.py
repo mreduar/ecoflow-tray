@@ -34,6 +34,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+import paho.mqtt.client as mqtt
 import pystray
 from PIL import Image, ImageDraw, ImageFont
 
@@ -228,16 +229,21 @@ def list_devices(cfg):
     return api_get(cfg, "/iot-open/sign/device/list") or []
 
 
-def fetch_reading(cfg):
-    data = api_get(cfg, "/iot-open/sign/device/quota/all", {"sn": cfg["sn"]})
-    soc = int(round(float(data.get(cfg.get("soc_field", DEFAULT_SOC_FIELD), 0))))
-    watts_in = int(round(float(data.get("pd.wattsInSum", 0))))
-    watts_out = int(round(float(data.get("pd.wattsOutSum", 0))))
+def fetch_full_quota(cfg):
+    """HTTP snapshot of the full device quota (cached in the cloud)."""
+    return api_get(cfg, "/iot-open/sign/device/quota/all", {"sn": cfg["sn"]}) or {}
+
+
+def reading_from_quota(quota, soc_field):
+    """Derive the display reading from a (merged) quota dict."""
+    soc = int(round(float(quota.get(soc_field, 0))))
+    watts_in = int(round(float(quota.get("pd.wattsInSum", 0))))
+    watts_out = int(round(float(quota.get("pd.wattsOutSum", 0))))
     net = watts_in - watts_out
     if net > 5:
-        state, remain = "Charging", data.get("bms_emsStatus.chgRemainTime", UNKNOWN_TIME)
+        state, remain = "Charging", quota.get("bms_emsStatus.chgRemainTime", UNKNOWN_TIME)
     elif net < -5:
-        state, remain = "Discharging", data.get("bms_emsStatus.dsgRemainTime", UNKNOWN_TIME)
+        state, remain = "Discharging", quota.get("bms_emsStatus.dsgRemainTime", UNKNOWN_TIME)
     else:
         state, remain = "Idle", UNKNOWN_TIME
     return {
@@ -279,6 +285,100 @@ def soc_candidates(data):
         out.append((k, v))
     out.sort(key=lambda kv: (SOC_PRIORITY.index(kv[0]) if kv[0] in SOC_PRIORITY else 999, kv[0]))
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Live updates over MQTT
+# The HTTP quota is a cached snapshot that only refreshes when a session is
+# active (e.g. the phone app). MQTT is the live stream the app uses; it pushes
+# updates on its own and does NOT need the phone app to be open.
+# --------------------------------------------------------------------------- #
+# MQTT messages use "status" module names; map them back to the HTTP field names.
+_MQTT_STATUS_TO_PLAIN = {
+    "pdStatus": "pd", "mpptStatus": "mppt", "emsStatus": "bms_emsStatus",
+    "bmsStatus": "bms_bmsStatus", "bmsInfo": "bms_bmsInfo", "invStatus": "inv",
+    "bmsSlaveStatus": "bms_slave", "bmsSlaveStatus_1": "bms_slave_bmsSlaveStatus_1",
+    "bmsSlaveStatus_2": "bms_slave_bmsSlaveStatus_2",
+}
+
+
+def mqtt_to_plain(raw):
+    """Convert one MQTT quota message into a flat HTTP-style {field: value} dict."""
+    prefix = ""
+    type_code = raw.get("typeCode")
+    if type_code:
+        prefix = _MQTT_STATUS_TO_PLAIN.get(type_code, "unknown_" + type_code) + "."
+    elif "cmdFunc" in raw and "cmdId" in raw:
+        prefix = f"{raw['cmdFunc']}_{raw['cmdId']}."
+    flat = {}
+    for src in ("param", "params"):
+        block = raw.get(src)
+        if isinstance(block, dict):
+            for k, v in block.items():
+                flat[f"{prefix}{k}"] = v
+                if isinstance(v, dict):  # flatten one nested level
+                    for k2, v2 in v.items():
+                        flat[f"{prefix}{k}.{k2}"] = v2
+    return flat
+
+
+class EcoflowMqtt:
+    """Subscribes to the device's live quota topic and pushes merged updates."""
+
+    def __init__(self, cfg, on_update, on_status):
+        self.cfg = cfg
+        self.on_update = on_update   # called with a flat {field: value} dict
+        self.on_status = on_status   # called with a short status string
+        self.client = None
+        self._stopped = False
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        try:
+            data = api_get(self.cfg, "/iot-open/sign/certification")
+            host, port = data["url"], int(data["port"])
+            user, password = data["certificateAccount"], data["certificatePassword"]
+        except Exception as err:
+            self.on_status(f"MQTT auth failed: {err}")
+            return
+        self.topic = f"/open/{user}/{self.cfg['sn']}/quota"
+        # Stable client_id: EcoFlow allows only ~10 unique client IDs per day.
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"EcoFlowTray-{user}")
+        client.username_pw_set(user, password)
+        client.tls_set()
+        client.on_connect = self._on_connect
+        client.on_message = self._on_message
+        client.reconnect_delay_set(min_delay=2, max_delay=60)
+        self.client = client
+        try:
+            client.connect(host, port, keepalive=60)
+            client.loop_forever(retry_first_connection=True)
+        except Exception as err:
+            if not self._stopped:
+                self.on_status(f"MQTT error: {err}")
+
+    def _on_connect(self, client, userdata, flags, reason_code, properties):
+        if getattr(reason_code, "is_failure", False):
+            self.on_status(f"MQTT rejected: {reason_code}")
+        else:
+            client.subscribe(self.topic, qos=1)
+            self.on_status("Live (MQTT)")
+
+    def _on_message(self, client, userdata, msg):
+        try:
+            self.on_update(mqtt_to_plain(json.loads(msg.payload.decode())))
+        except Exception:
+            pass
+
+    def stop(self):
+        self._stopped = True
+        if self.client:
+            try:
+                self.client.disconnect()
+            except Exception:
+                pass
 
 
 # --------------------------------------------------------------------------- #
@@ -601,7 +701,7 @@ class SettingsDialog:
             set_autostart(self.autostart_var.get())
         except Exception as err:  # non-fatal: config still saved
             messagebox.showwarning(APP_TITLE, f"Could not change autostart:\n{err}", parent=self.win)
-        self.app.refresh_event.set()  # fetch immediately with the new settings
+        self.app.apply_new_config()  # re-seed via HTTP and (re)connect MQTT
         self.close()
 
     def close(self):
@@ -621,8 +721,16 @@ class App:
         self.stop_event = threading.Event()
         self.refresh_event = threading.Event()
         self.ui_queue = queue.Queue()
-        self.state = {"soc": "--", "detail": "Not configured"}
+        self.state = {"soc": "--", "detail": "Not configured", "source": ""}
         self.settings_win = None
+
+        # Shared merged quota state, fed by HTTP (seed) and MQTT (live updates).
+        self.quota = {}
+        self.quota_lock = threading.Lock()
+        self.mqtt = None
+        self.last_live = 0.0     # time of last MQTT message
+        self.force_http = False  # set by "Refresh now"
+        self._last_icon_key = None  # (soc, charging) last rendered
 
         self.root = tk.Tk()
         self.root.withdraw()
@@ -636,6 +744,7 @@ class App:
             menu=pystray.Menu(
                 pystray.MenuItem(lambda i: f"Battery: {self.state['soc']}%", None, enabled=False),
                 pystray.MenuItem(lambda i: self.state["detail"], None, enabled=False),
+                pystray.MenuItem(lambda i: self.state.get("source") or "Connecting…", None, enabled=False),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("Refresh now", self._on_refresh),
                 pystray.MenuItem("Settings...", self._on_settings, default=True),
@@ -673,6 +782,7 @@ class App:
         self.post(self.open_settings)
 
     def _on_refresh(self, icon, item):
+        self.force_http = True
         self.refresh_event.set()
 
     def _on_quit(self, icon, item):
@@ -694,10 +804,14 @@ class App:
                 self.settings_win = None
         SettingsDialog(self)
 
-    # -- icon/state updates (called from worker thread) ------------------- #
+    # -- icon/state updates ---------------------------------------------- #
     def _apply(self, reading):
-        self.icon.icon = render_icon(reading["soc"], reading["charging"])
-        self.icon.title = tooltip_for(reading)
+        src = self.state.get("source")
+        key = (reading["soc"], reading["charging"])
+        if key != self._last_icon_key:  # only re-render when the % or state changes
+            self.icon.icon = render_icon(reading["soc"], reading["charging"])
+            self._last_icon_key = key
+        self.icon.title = tooltip_for(reading) + (f"\n{src}" if src else "")
         self.state["soc"] = reading["soc"]
         self.state["detail"] = (
             f"{reading['state']} - In {reading['watts_in']}W / Out {reading['watts_out']}W"
@@ -706,19 +820,66 @@ class App:
 
     def _apply_status(self, soc_text, detail, tooltip):
         self.icon.icon = render_icon(None, False)
+        self._last_icon_key = None
         self.icon.title = tooltip
         self.state["soc"] = soc_text
         self.state["detail"] = detail
         self.icon.update_menu()
 
+    def _merge_and_apply(self, fields, replace=False):
+        soc_field = self.cfg.get("soc_field", DEFAULT_SOC_FIELD)
+        with self.quota_lock:
+            if replace:
+                self.quota = dict(fields)
+            else:
+                self.quota.update(fields)
+            quota = dict(self.quota)
+        if soc_field in quota:  # avoid a 0% flash from a partial update
+            self._apply(reading_from_quota(quota, soc_field))
+
+    # -- MQTT callbacks (run on the paho thread) ------------------------- #
+    def _on_mqtt_update(self, fields):
+        self.last_live = time.time()
+        self._merge_and_apply(fields)
+
+    def _on_mqtt_status(self, text):
+        self.state["source"] = text
+        self.icon.update_menu()
+
+    def start_mqtt(self):
+        if self.mqtt:
+            self.mqtt.stop()
+            self.mqtt = None
+        self.last_live = 0.0
+        if is_configured(self.cfg):
+            self.state["source"] = "Connecting…"
+            self.mqtt = EcoflowMqtt(dict(self.cfg), self._on_mqtt_update, self._on_mqtt_status)
+            self.mqtt.start()
+
+    def apply_new_config(self):
+        with self.quota_lock:
+            self.quota = {}          # drop state from a previous device
+        self.force_http = True
+        self.refresh_event.set()     # re-seed over HTTP right away
+        self.start_mqtt()            # reconnect MQTT with the new keys/device
+
     def _worker(self):
         while not self.stop_event.is_set():
             if is_configured(self.cfg):
-                try:
-                    self._apply(fetch_reading(self.cfg))
-                except Exception as err:  # surface any failure in the tooltip
-                    self._apply_status("!", f"Error: {err}", f"{APP_TITLE}: error\n{err}")
-                wait = int(self.cfg.get("refresh_seconds", DEFAULT_REFRESH))
+                refresh = int(self.cfg.get("refresh_seconds", DEFAULT_REFRESH))
+                soc_field = self.cfg.get("soc_field", DEFAULT_SOC_FIELD)
+                with self.quota_lock:
+                    have_data = soc_field in self.quota
+                mqtt_fresh = (time.time() - self.last_live) < max(120, 2 * refresh)
+                force, self.force_http = self.force_http, False
+                # HTTP is a stale snapshot; use it only to seed, as a fallback
+                # when MQTT is silent, or when the user hits "Refresh now".
+                if force or not have_data or not mqtt_fresh:
+                    try:
+                        self._merge_and_apply(fetch_full_quota(self.cfg), replace=not have_data)
+                    except Exception as err:
+                        self._apply_status("!", f"Error: {err}", f"{APP_TITLE}: error\n{err}")
+                wait = refresh
             else:
                 self._apply_status("--", "Not configured - open Settings",
                                    f"{APP_TITLE}: not configured")
@@ -727,10 +888,12 @@ class App:
             self.refresh_event.clear()
 
     def _on_ready(self, icon):
-        # Runs on the pystray thread once the tray icon actually exists, so the
-        # worker's first fetch/update is applied to a live icon (not lost).
+        # Runs on the pystray thread once the tray icon exists, so the first
+        # update is applied to a live icon (not lost).
         icon.visible = True
         threading.Thread(target=self._worker, daemon=True).start()
+        if is_configured(self.cfg):
+            self.start_mqtt()
 
     def run(self):
         threading.Thread(target=lambda: self.icon.run(setup=self._on_ready), daemon=True).start()

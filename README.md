@@ -10,6 +10,7 @@ interval you choose. Built for the **DELTA 2 Max** but works with any EcoFlow
 device exposed through the official Developer API.
 
 - 🟢 **Live tray icon** — color-coded: green (high), amber/orange (low), red (<15%), cyan (charging)
+- ⚡ **Real-time updates over MQTT** — pushed live from EcoFlow's broker; the number keeps moving **without keeping the phone app open**
 - 🖱️ **Right-click menu** — status, power in/out, time remaining, refresh, settings, quit
 - ⚙️ **Settings UI** — enter your API keys, pick your device, set the polling interval; no file editing
 - 🔋 **Smart battery-field detection** — reads your device's live data and lets you pick the value that matches the EcoFlow app (any model), with a custom option
@@ -55,6 +56,15 @@ They can differ, so the app doesn't guess blindly. After you pick your device,
 Settings reads your device's **live** data and lists every battery field it
 reports **with its current value** — just pick the number that matches your app.
 `Custom field…` lets advanced users type an exact field name.
+
+## How updates work
+
+The EcoFlow HTTP endpoint (`quota/all`) returns a **cached snapshot** that only
+refreshes while a session is active — which is why polling it alone leaves the
+value frozen until you open the phone app. This app instead subscribes to
+EcoFlow's **MQTT** stream (the same one the app uses), so the device pushes live
+updates on its own. HTTP is used only for the initial reading and as a fallback
+if MQTT goes quiet. The "Refresh every (seconds)" setting controls that fallback.
 
 ## Start with Windows
 
