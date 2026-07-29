@@ -16,6 +16,10 @@ device exposed through the official Developer API.
 - 🚀 **Start with Windows** — one checkbox
 - 🔒 **Keys stay local** — stored per-user in `%APPDATA%`, secret encrypted with Windows DPAPI
 
+<p align="center">
+  <img src="docs/screenshot.png" width="520" alt="EcoFlow Tray settings window">
+</p>
+
 ---
 
 ## Download
