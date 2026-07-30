@@ -593,7 +593,8 @@ class SettingsDialog:
                 devices = list_devices(draft)
                 self.app.post(lambda: self._devices_loaded(devices))
             except Exception as err:
-                self.app.post(lambda: self._devices_failed(err))
+                # bind err now: Python unbinds it when the except block ends
+                self.app.post(lambda err=err: self._devices_failed(err))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -636,7 +637,7 @@ class SettingsDialog:
                 cands = soc_candidates(data)
                 self.app.post(lambda: self._soc_loaded(cands))
             except Exception as err:
-                self.app.post(lambda: self._set_status(f"Field detect failed: {err}", "#c00"))
+                self.app.post(lambda err=err: self._set_status(f"Field detect failed: {err}", "#c00"))
 
         threading.Thread(target=work, daemon=True).start()
 
