@@ -5,8 +5,13 @@ Shows the battery percentage as a live tray icon. Right-click for a menu with
 device status, a Settings dialog (enter your API keys, pick your device, set the
 polling interval) and Quit.
 
+Optionally sends Telegram alerts when grid power is lost or restored, and when
+the battery drops past two configurable levels. Each user supplies their own bot
+token, so no server is involved - alerts are plain HTTPS calls to the Bot API.
+
 Credentials are stored per-user in %APPDATA%\\EcoFlowTray\\config.json. The secret
-key is encrypted at rest with Windows DPAPI (tied to the current user account).
+key and bot token are encrypted at rest with Windows DPAPI (tied to the current
+user account).
 
 Modes:
     EcoFlowTray.exe                Start the tray app (Settings opens on first run)
@@ -18,6 +23,7 @@ import base64
 import ctypes
 import hashlib
 import hmac
+import html
 import json
 import os
 import queue
@@ -25,6 +31,7 @@ import random
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import winreg
@@ -52,6 +59,14 @@ DEFAULT_SOC_FIELD = "bms_emsStatus.f32LcdShowSoc"
 CUSTOM_SOC_LABEL = "Custom field…"
 DEFAULT_REFRESH = 60
 UNKNOWN_TIME = 5999  # EcoFlow sentinel for "no estimate available"
+
+# Grid (AC input) watch + Telegram alerts
+DEFAULT_GRID_FIELD = "inv.acInVol"
+DEFAULT_GRID_THRESHOLD = 80000  # mV - see default_grid_threshold()
+DEFAULT_OUTAGE_DELAY_MIN = 1.0
+DEFAULT_RESTORE_DELAY_MIN = 1.0
+DEFAULT_BATT_ALERT_1 = 30
+DEFAULT_BATT_ALERT_2 = 15
 
 
 # --------------------------------------------------------------------------- #
@@ -103,19 +118,36 @@ def dpapi_decrypt(b64: str) -> str:
 # --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
+_SECRET_FIELDS = ("secret_key", "telegram_token")
+
+CONFIG_DEFAULTS = {
+    "host": DEFAULT_HOST,
+    "refresh_seconds": DEFAULT_REFRESH,
+    "soc_field": DEFAULT_SOC_FIELD,
+    "telegram_enabled": False,
+    "telegram_chat_id": "",
+    "grid_field": DEFAULT_GRID_FIELD,
+    "grid_threshold": DEFAULT_GRID_THRESHOLD,
+    "outage_delay_min": DEFAULT_OUTAGE_DELAY_MIN,
+    "restore_delay_min": DEFAULT_RESTORE_DELAY_MIN,
+    "batt_alert_1": DEFAULT_BATT_ALERT_1,
+    "batt_alert_2": DEFAULT_BATT_ALERT_2,
+}
+
+
 def load_config() -> dict:
     if not CONFIG_PATH.exists():
-        return {}
+        return dict(CONFIG_DEFAULTS)
     cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    if cfg.get("secret_key_enc"):
-        try:
-            cfg["secret_key"] = dpapi_decrypt(cfg["secret_key_enc"])
-        except Exception:
-            cfg["secret_key"] = ""
-    cfg.setdefault("secret_key", "")
-    cfg.setdefault("host", DEFAULT_HOST)
-    cfg.setdefault("refresh_seconds", DEFAULT_REFRESH)
-    cfg.setdefault("soc_field", DEFAULT_SOC_FIELD)
+    for name in _SECRET_FIELDS:
+        if cfg.get(f"{name}_enc"):
+            try:
+                cfg[name] = dpapi_decrypt(cfg[f"{name}_enc"])
+            except Exception:
+                cfg[name] = ""
+        cfg.setdefault(name, "")
+    for key, value in CONFIG_DEFAULTS.items():
+        cfg.setdefault(key, value)
     return cfg
 
 
@@ -128,13 +160,22 @@ def save_config(cfg: dict) -> None:
         "host": cfg.get("host", DEFAULT_HOST),
         "refresh_seconds": int(cfg.get("refresh_seconds", DEFAULT_REFRESH)),
         "soc_field": cfg.get("soc_field", DEFAULT_SOC_FIELD),
+        "telegram_enabled": bool(cfg.get("telegram_enabled", False)),
+        "telegram_chat_id": str(cfg.get("telegram_chat_id", "")),
+        "grid_field": cfg.get("grid_field", DEFAULT_GRID_FIELD),
+        "grid_threshold": float(cfg.get("grid_threshold", DEFAULT_GRID_THRESHOLD)),
+        "outage_delay_min": float(cfg.get("outage_delay_min", DEFAULT_OUTAGE_DELAY_MIN)),
+        "restore_delay_min": float(cfg.get("restore_delay_min", DEFAULT_RESTORE_DELAY_MIN)),
+        "batt_alert_1": int(cfg.get("batt_alert_1", DEFAULT_BATT_ALERT_1)),
+        "batt_alert_2": int(cfg.get("batt_alert_2", DEFAULT_BATT_ALERT_2)),
     }
-    secret = cfg.get("secret_key", "")
-    enc = dpapi_encrypt(secret) if secret else None
-    if enc:
-        out["secret_key_enc"] = enc
-    else:
-        out["secret_key"] = secret  # plaintext fallback if DPAPI is unavailable
+    for name in _SECRET_FIELDS:
+        value = cfg.get(name, "")
+        enc = dpapi_encrypt(value) if value else None
+        if enc:
+            out[f"{name}_enc"] = enc
+        else:
+            out[name] = value  # plaintext fallback if DPAPI is unavailable
     CONFIG_PATH.write_text(json.dumps(out, indent=2), encoding="utf-8")
 
 
@@ -287,6 +328,66 @@ def soc_candidates(data):
     return out
 
 
+# Fields that report AC (grid) input, best first. Voltage beats watts: a full
+# battery stops drawing power, so watts drop to 0 while the grid is still there.
+GRID_PRIORITY = [
+    # Classic line (DELTA 2/Max, DELTA Pro/Max/Mini, RIVER 2/Pro/Max)
+    "inv.acInVol", "inv.acInAmp", "inv.acInFreq",
+    "inv.inputWatts", "inv.acInputWatts",
+    # Newer line (DELTA 3, DELTA Pro 3, RIVER 3) renamed everything
+    "plug_in_info_ac_in_vol", "plug_in_info_ac_in_amp", "pow_get_ac_in",
+    "bms_emsStatus.chgLinePlug",
+    # Totals last: they fold solar in, so they can mask an outage
+    "pd.wattsInSum", "pow_in_sum_w",
+]
+_GRID_MATCH = ("acinvol", "acinamp", "acinfreq", "acinputwatts", "inputwatts",
+               "wattsinsum", "powgetacin", "powinsumw")
+# Solar input must not count as "the grid is up".
+_GRID_EXCLUDE_PREFIX = ("mppt.", "pv.", "bms_")
+# Offered despite the bms_ prefix: "AC cable connected". Not a 0/1 flag - a
+# DELTA 2 Max reads 0 unplugged and 34 plugged in - but zero vs non-zero is a
+# cleaner signal than any voltage threshold on devices that report it.
+_GRID_ALLOW = ("bms_emsStatus.chgLinePlug", "ems.chgLinePlug")
+
+
+def grid_candidates(data):
+    """From a quota dict, return [(field, value)] of plausible AC-input fields,
+    best 'is the grid up?' signal first."""
+    out = []
+    for k, v in (data or {}).items():
+        kl = k.lower()
+        if not isinstance(v, (int, float)) or isinstance(v, bool):
+            continue
+        if k not in _GRID_ALLOW:
+            if kl.startswith(_GRID_EXCLUDE_PREFIX):
+                continue
+            if not any(p in kl.replace("_", "") for p in _GRID_MATCH):
+                continue
+        out.append((k, v))
+    out.sort(key=lambda kv: (GRID_PRIORITY.index(kv[0]) if kv[0] in GRID_PRIORITY else 999, kv[0]))
+    return out
+
+
+def default_grid_threshold(field, value=0):
+    """Pick a sensible 'grid is present' threshold for a field.
+
+    Voltage does NOT fall to zero when the mains drop: a DELTA 2 Max idles at
+    ~36 V / 41 Hz on an open input. So the bar has to sit well above that idle
+    reading but below any real mains voltage (100 V and up). Devices report
+    volts either in mV or V, so the observed magnitude picks the unit.
+    """
+    fl = field.lower()
+    if fl.endswith("plug"):   # "AC cable connected": zero vs non-zero, e.g.
+        return 0              # chgLinePlug. Must not catch ..._ac_in_vol.
+    if "vol" in fl:
+        return 80000 if value >= 1000 else 80
+    if "freq" in fl:
+        return 45   # clears a ~41 Hz idle, still under both 50 and 60 Hz mains
+    if "amp" in fl:
+        return 0    # current reads a hard 0 with no mains, in A or mA alike
+    return 5        # watts idle at zero, give or take sensor noise
+
+
 # --------------------------------------------------------------------------- #
 # Live updates over MQTT
 # The HTTP quota is a cached snapshot that only refreshes when a session is
@@ -382,6 +483,243 @@ class EcoflowMqtt:
 
 
 # --------------------------------------------------------------------------- #
+# Telegram Bot API
+# Plain HTTPS calls - no server, no webhook. Each user creates their own bot
+# with @BotFather, pastes the token here, and sends it /start once so the chat
+# ID can be detected.
+# --------------------------------------------------------------------------- #
+def telegram_call(token, method, params=None, timeout=20):
+    url = f"https://api.telegram.org/bot{urllib.parse.quote(token, safe='')}/{method}"
+    data = urllib.parse.urlencode(params or {}).encode()
+    req = urllib.request.Request(url, data=data, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as err:  # Telegram puts the reason in the body
+        try:
+            payload = json.loads(err.read().decode())
+        except Exception:
+            raise RuntimeError(f"HTTP {err.code}") from None
+    if not payload.get("ok"):
+        raise RuntimeError(payload.get("description", "Telegram API error"))
+    return payload.get("result")
+
+
+def telegram_check_token(token):
+    """Return the bot's @username, raising if the token is invalid."""
+    return (telegram_call(token, "getMe") or {}).get("username", "?")
+
+
+def telegram_send(token, chat_id, text):
+    telegram_call(token, "sendMessage", {
+        "chat_id": chat_id, "text": text,
+        "parse_mode": "HTML", "disable_web_page_preview": "true",
+    })
+
+
+def telegram_detect_chat(token):
+    """Return (chat_id, display name) from the newest message sent to the bot,
+    or (None, None) if nobody has messaged it yet."""
+    for upd in reversed(telegram_call(token, "getUpdates", {"limit": 20, "timeout": 0}) or []):
+        msg = upd.get("message") or upd.get("edited_message") or upd.get("channel_post")
+        chat = (msg or {}).get("chat") or {}
+        if chat.get("id") is not None:
+            name = chat.get("title") or " ".join(
+                x for x in (chat.get("first_name"), chat.get("last_name")) if x
+            ) or chat.get("username") or str(chat["id"])
+            return str(chat["id"]), name
+    return None, None
+
+
+# --------------------------------------------------------------------------- #
+# Alerting - debounced grid-outage and battery-level notifications
+# The house losing power usually takes the router down too, so a send can fail
+# for reasons that have nothing to do with the message. Alerts are queued and
+# retried, and each one carries the timestamp of the event, not of the send.
+# --------------------------------------------------------------------------- #
+def _fmt_duration(seconds):
+    minutes = max(0, int(seconds // 60))
+    h, m = divmod(minutes, 60)
+    return f"{h}h {m}m" if h else f"{m}m"
+
+
+def _fmt_clock(when):
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(when))
+
+
+def _alert_body(reading):
+    parts = [f"Battery {reading['soc']}%"]
+    if reading["watts_out"]:
+        parts.append(f"Load {reading['watts_out']} W")
+    if reading["watts_in"]:
+        parts.append(f"In {reading['watts_in']} W")
+    if reading["remain_min"] is not None:
+        parts.append(f"{_fmt_remain(reading['remain_min'])}")
+    return " · ".join(parts)
+
+
+class Alerter:
+    """Watches AC input and battery level, and pushes Telegram alerts.
+
+    Transitions must hold for the user's configured delay before they count, so
+    a brief flicker doesn't fire an alert. State is tracked even while Telegram
+    is off, so enabling it never dumps a backlog of stale events.
+    """
+
+    TICK_SECONDS = 10
+    REARM_MARGIN = 5       # % the battery must climb back before an alert re-arms
+    MAX_AGE_SECONDS = 6 * 3600
+    RETRY_DELAYS = (15, 30, 60, 120, 300, 600)
+
+    def __init__(self, get_cfg, on_status=None):
+        self.get_cfg = get_cfg
+        self.on_status = on_status or (lambda text: None)
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.outbox = []          # [{"text", "created", "tries", "next_try"}]
+        self.latest = None        # (reading, grid_present) from the last update
+        self.grid = None          # confirmed grid state: True / False / None
+        self.grid_since = 0.0
+        self.pending = None       # candidate state waiting out its delay
+        self.pending_since = 0.0
+        self.batt_armed = {}      # {config key: bool}
+        self.batt_level = {}      # {config key: threshold it was armed at}
+
+    def start(self):
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def stop(self):
+        self.stop_event.set()
+
+    def reset(self):
+        """Forget tracked state (device or watched field changed)."""
+        with self.lock:
+            self.latest = None
+            self.grid = self.pending = None
+            self.batt_armed.clear()
+            self.batt_level.clear()
+
+    # -- observation ------------------------------------------------------- #
+    def observe(self, quota, reading):
+        cfg = self.get_cfg()
+        value = quota.get(cfg.get("grid_field", DEFAULT_GRID_FIELD))
+        present = None
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            present = float(value) > float(cfg.get("grid_threshold", DEFAULT_GRID_THRESHOLD))
+        with self.lock:
+            self.latest = (reading, present)
+        self.evaluate()
+
+    def evaluate(self):
+        with self.lock:
+            snapshot = self.latest
+        if not snapshot:
+            return
+        reading, present = snapshot
+        cfg, now = self.get_cfg(), time.time()
+        device = cfg.get("device_name") or "EcoFlow"
+        for text in self._grid_events(present, reading, device, cfg, now) + \
+                self._battery_events(reading, device, cfg):
+            self._queue(text, now)
+
+    def _grid_events(self, present, reading, device, cfg, now):
+        if present is None:
+            return []
+        if self.grid is None:                      # first reading: adopt silently
+            self.grid, self.grid_since, self.pending = present, now, None
+            return []
+        if present == self.grid:
+            self.pending = None
+            return []
+        if self.pending != present:                # transition just started
+            self.pending, self.pending_since = present, now
+            return []
+        key = "restore_delay_min" if present else "outage_delay_min"
+        default = DEFAULT_RESTORE_DELAY_MIN if present else DEFAULT_OUTAGE_DELAY_MIN
+        if now - self.pending_since < 60 * float(cfg.get(key, default)):
+            return []
+        began = self.pending_since                 # the event, not its confirmation
+        held = began - self.grid_since
+        self.grid, self.grid_since, self.pending = present, began, None
+        if present:
+            return [f"🟢 <b>Power restored</b>\n{html.escape(device)} is back on grid power.\n"
+                    f"{_alert_body(reading)}\nOutage lasted {_fmt_duration(held)} · {_fmt_clock(began)}"]
+        return [f"🔴 <b>Power outage</b>\n{html.escape(device)} is running on battery.\n"
+                f"{_alert_body(reading)}\n{_fmt_clock(began)}"]
+
+    def _battery_events(self, reading, device, cfg):
+        soc, crossed = reading["soc"], []
+        for key in ("batt_alert_1", "batt_alert_2"):
+            try:
+                level = int(cfg.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if not 1 <= level <= 100:
+                continue
+            if self.batt_level.get(key) != level:  # new or changed threshold
+                self.batt_level[key] = level
+                self.batt_armed[key] = soc > level
+                continue
+            if self.batt_armed.get(key) and soc <= level:
+                self.batt_armed[key] = False
+                crossed.append(level)
+            elif not self.batt_armed.get(key) and soc >= level + self.REARM_MARGIN:
+                self.batt_armed[key] = True
+        if not crossed:
+            return []
+        level = min(crossed)  # a steep drop past both thresholds is still one alert
+        icon = "🪫" if level <= 20 else "⚠️"
+        return [f"{icon} <b>Battery at {soc}%</b>\n{html.escape(device)} dropped below {level}%.\n"
+                f"{_alert_body(reading)}\n{_fmt_clock(time.time())}"]
+
+    # -- delivery ---------------------------------------------------------- #
+    def _queue(self, text, now):
+        cfg = self.get_cfg()
+        if not (cfg.get("telegram_enabled") and cfg.get("telegram_token")
+                and cfg.get("telegram_chat_id")):
+            return
+        with self.lock:
+            self.outbox.append({"text": text, "created": now, "tries": 0, "next_try": now})
+
+    def _loop(self):
+        while not self.stop_event.wait(self.TICK_SECONDS):
+            try:
+                self.evaluate()   # let a pending transition age out without new data
+                self._flush()
+            except Exception:
+                pass
+
+    def _flush(self):
+        cfg = self.get_cfg()
+        token, chat = cfg.get("telegram_token"), cfg.get("telegram_chat_id")
+        if not (cfg.get("telegram_enabled") and token and chat):
+            with self.lock:   # switched off mid-flight: don't deliver later
+                self.outbox.clear()
+            return
+        now = time.time()
+        with self.lock:
+            due = [m for m in self.outbox if m["next_try"] <= now]
+        for msg in due:
+            if now - msg["created"] > self.MAX_AGE_SECONDS:
+                self._drop(msg)
+                self.on_status("Telegram: alert expired undelivered")
+                continue
+            try:
+                telegram_send(token, chat, msg["text"])
+                self._drop(msg)
+            except Exception as err:
+                msg["tries"] += 1
+                delay = self.RETRY_DELAYS[min(msg["tries"] - 1, len(self.RETRY_DELAYS) - 1)]
+                msg["next_try"] = now + delay
+                self.on_status(f"Telegram: send failed ({err}), retrying")
+
+    def _drop(self, msg):
+        with self.lock:
+            if msg in self.outbox:
+                self.outbox.remove(msg)
+
+
+# --------------------------------------------------------------------------- #
 # Icon rendering
 # --------------------------------------------------------------------------- #
 _FONT_CANDIDATES = [
@@ -464,6 +802,7 @@ class SettingsDialog:
         cfg = app.cfg
         self.devices = []  # list of (label, sn)
         self.soc_choices = []  # list of (label, field)
+        self.grid_values = {}  # {field: last seen value}
 
         win = tk.Toplevel(app.root)
         self.win = win
@@ -476,9 +815,11 @@ class SettingsDialog:
         except Exception:
             pass
 
-        frm = ttk.Frame(win, padding=16)
-        frm.grid(sticky="nsew")
+        nb = self.nb = ttk.Notebook(win)
+        nb.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 0))
+        frm = ttk.Frame(nb, padding=16)
         frm.columnconfigure(1, weight=1)
+        nb.add(frm, text="Device")
         row = 0
 
         ttk.Label(frm, text="Access Key").grid(row=row, column=0, sticky="w", pady=4)
@@ -552,8 +893,10 @@ class SettingsDialog:
                   foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w")
         row += 1
 
-        btns = ttk.Frame(frm)
-        btns.grid(row=row, column=0, columnspan=3, sticky="e", pady=(16, 0))
+        self._build_notifications_tab(nb)
+
+        btns = ttk.Frame(win, padding=(16, 10))
+        btns.grid(row=1, column=0, sticky="e")
         ttk.Button(btns, text="Cancel", command=self.close).grid(row=0, column=0, padx=6)
         ttk.Button(btns, text="Save", command=self._on_save).grid(row=0, column=1)
 
@@ -565,6 +908,193 @@ class SettingsDialog:
         # shows real values without needing to click "Test" again.
         if is_configured(cfg):
             win.after(150, self._load_soc_fields)
+
+    # -- notifications tab ------------------------------------------------- #
+    def _build_notifications_tab(self, nb):
+        cfg = self.app.cfg
+        frm = ttk.Frame(nb, padding=16)
+        frm.columnconfigure(1, weight=1)
+        nb.add(frm, text="Notifications")
+        row = 0
+
+        self.tg_enabled = tk.BooleanVar(value=bool(cfg.get("telegram_enabled")))
+        ttk.Checkbutton(frm, text="Send Telegram alerts", variable=self.tg_enabled)\
+            .grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        row += 1
+
+        ttk.Label(frm, text="Bot token").grid(row=row, column=0, sticky="w", pady=4)
+        self.e_token = ttk.Entry(frm, width=38, show="\u2022")
+        self.e_token.insert(0, cfg.get("telegram_token", ""))
+        self.e_token.grid(row=row, column=1, sticky="ew", pady=4)
+        self.tg_show = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frm, text="Show", variable=self.tg_show, command=self._toggle_token)\
+            .grid(row=row, column=2, sticky="w", padx=(8, 0))
+        row += 1
+
+        ttk.Label(frm, text="Chat ID").grid(row=row, column=0, sticky="w", pady=4)
+        self.e_chat = ttk.Entry(frm, width=38)
+        self.e_chat.insert(0, cfg.get("telegram_chat_id", ""))
+        self.e_chat.grid(row=row, column=1, sticky="ew", pady=4)
+        self.btn_detect = ttk.Button(frm, text="Detect", width=9, command=self._on_detect_chat)
+        self.btn_detect.grid(row=row, column=2, sticky="w", padx=(8, 0))
+        row += 1
+
+        self.btn_test_tg = ttk.Button(frm, text="Send test message", command=self._on_test_telegram)
+        self.btn_test_tg.grid(row=row, column=0, sticky="w", pady=(6, 2))
+        self.lbl_tg = ttk.Label(frm, text="", foreground="#666", wraplength=300, justify="left")
+        self.lbl_tg.grid(row=row, column=1, columnspan=2, sticky="w", pady=(6, 2))
+        row += 1
+
+        ttk.Label(frm, justify="left", foreground="#888",
+                  text="1. Message @BotFather on Telegram \u2192 /newbot \u2192 copy the token.\n"
+                       "2. Open your new bot and send it /start.\n"
+                       "3. Paste the token above, then click Detect.")\
+            .grid(row=row, column=0, columnspan=3, sticky="w", pady=(2, 0))
+        row += 1
+
+        ttk.Separator(frm, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=12)
+        row += 1
+
+        ttk.Label(frm, text="Grid input field").grid(row=row, column=0, sticky="w", pady=4)
+        self.cb_grid = ttk.Combobox(frm, values=[], width=30)  # editable: any field name
+        self.cb_grid.set(cfg.get("grid_field", DEFAULT_GRID_FIELD))
+        self.cb_grid.grid(row=row, column=1, columnspan=2, sticky="ew", pady=4)
+        self.cb_grid.bind("<<ComboboxSelected>>", lambda e: self._update_grid_preview())
+        self.cb_grid.bind("<KeyRelease>", lambda e: self._update_grid_preview())
+        row += 1
+
+        ttk.Label(frm, text="Power is on above").grid(row=row, column=0, sticky="w", pady=4)
+        self.sp_thresh = ttk.Spinbox(frm, from_=0, to=1000000, increment=1, width=10,
+                                     command=self._update_grid_preview)
+        self.sp_thresh.set(self._tidy(cfg.get("grid_threshold", DEFAULT_GRID_THRESHOLD)))
+        self.sp_thresh.grid(row=row, column=1, sticky="w", pady=4)
+        self.sp_thresh.bind("<KeyRelease>", lambda e: self._update_grid_preview())
+        row += 1
+
+        self.lbl_grid = ttk.Label(frm, text="", foreground="#888", wraplength=380, justify="left")
+        self.lbl_grid.grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        row += 1
+
+        ttk.Label(frm, text="Alert after (minutes) without power").grid(row=row, column=0, sticky="w", pady=4)
+        self.sp_outage = ttk.Spinbox(frm, from_=0, to=180, increment=1, width=10)
+        self.sp_outage.set(self._tidy(cfg.get("outage_delay_min", DEFAULT_OUTAGE_DELAY_MIN)))
+        self.sp_outage.grid(row=row, column=1, sticky="w", pady=4)
+        row += 1
+
+        ttk.Label(frm, text="Alert after (minutes) with power back").grid(row=row, column=0, sticky="w", pady=4)
+        self.sp_restore = ttk.Spinbox(frm, from_=0, to=180, increment=1, width=10)
+        self.sp_restore.set(self._tidy(cfg.get("restore_delay_min", DEFAULT_RESTORE_DELAY_MIN)))
+        self.sp_restore.grid(row=row, column=1, sticky="w", pady=4)
+        row += 1
+
+        ttk.Separator(frm, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=12)
+        row += 1
+
+        ttk.Label(frm, text="Battery alert 1 (%)").grid(row=row, column=0, sticky="w", pady=4)
+        self.sp_batt1 = ttk.Spinbox(frm, from_=0, to=100, increment=1, width=10)
+        self.sp_batt1.set(cfg.get("batt_alert_1", DEFAULT_BATT_ALERT_1))
+        self.sp_batt1.grid(row=row, column=1, sticky="w", pady=4)
+        row += 1
+
+        ttk.Label(frm, text="Battery alert 2 (%)").grid(row=row, column=0, sticky="w", pady=4)
+        self.sp_batt2 = ttk.Spinbox(frm, from_=0, to=100, increment=1, width=10)
+        self.sp_batt2.set(cfg.get("batt_alert_2", DEFAULT_BATT_ALERT_2))
+        self.sp_batt2.grid(row=row, column=1, sticky="w", pady=4)
+        row += 1
+
+        ttk.Label(frm, text="Alerts fire when the battery drops past a level. 0 turns one off.",
+                  foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w")
+
+    def _toggle_token(self):
+        self.e_token.config(show="" if self.tg_show.get() else "\u2022")
+
+    def _update_grid_preview(self):
+        field = self.cb_grid.get().strip()
+        if field not in self.grid_values:
+            self.lbl_grid.config(
+                text="Pick your device on the Device tab to read live AC-input values.")
+            return
+        value = self.grid_values[field]
+        try:
+            threshold = float(self.sp_thresh.get())
+        except ValueError:
+            threshold = DEFAULT_GRID_THRESHOLD
+        on = float(value) > threshold
+        self.lbl_grid.config(
+            text=f"Now: {value:g} \u2192 power is {'ON' if on else 'OFF'} "
+                 f"(with grid connected this should read ON).")
+
+    def _grid_loaded(self, cands):
+        self.grid_values = dict(cands)
+        self.cb_grid["values"] = [k for k, _ in cands]
+        # Only override the field when this device doesn't report the configured
+        # one - then the saved threshold belongs to a field that isn't in use.
+        if cands and self.cb_grid.get().strip() not in self.grid_values:
+            best, value = cands[0]
+            self.cb_grid.set(best)
+            self.sp_thresh.set(self._tidy(default_grid_threshold(best, value)))
+        self._update_grid_preview()
+
+    def _telegram_draft(self):
+        return self.e_token.get().strip(), self.e_chat.get().strip()
+
+    def _on_detect_chat(self):
+        token, _ = self._telegram_draft()
+        if not token:
+            self.lbl_tg.config(text="Paste your bot token first.", foreground="#c00")
+            return
+        self.btn_detect.config(state="disabled")
+        self.lbl_tg.config(text="Looking for your chat...", foreground="#666")
+
+        def work():
+            try:
+                bot = telegram_check_token(token)
+                chat_id, name = telegram_detect_chat(token)
+                self.app.post(lambda: self._chat_detected(bot, chat_id, name))
+            except Exception as err:
+                self.app.post(lambda err=err: self._telegram_failed(err))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _chat_detected(self, bot, chat_id, name):
+        self.btn_detect.config(state="normal")
+        if not chat_id:
+            self.lbl_tg.config(
+                text=f"@{bot} is valid, but nobody has messaged it yet. "
+                     "Open the bot in Telegram, send /start, then click Detect again.",
+                foreground="#c60")
+            return
+        self.e_chat.delete(0, tk.END)
+        self.e_chat.insert(0, chat_id)
+        self.lbl_tg.config(text=f"Found {name} via @{bot}.", foreground="#2a7")
+
+    def _telegram_failed(self, err):
+        self.btn_detect.config(state="normal")
+        self.btn_test_tg.config(state="normal")
+        self.lbl_tg.config(text=f"Failed: {err}", foreground="#c00")
+
+    def _on_test_telegram(self):
+        token, chat = self._telegram_draft()
+        if not token or not chat:
+            self.lbl_tg.config(text="Bot token and chat ID are both required.", foreground="#c00")
+            return
+        self.btn_test_tg.config(state="disabled")
+        self.lbl_tg.config(text="Sending...", foreground="#666")
+        device = self.app.cfg.get("device_name") or "EcoFlow"
+
+        def work():
+            try:
+                telegram_send(token, chat,
+                              f"\u2705 <b>{APP_TITLE}</b>\nAlerts for {html.escape(device)} are set up.")
+                self.app.post(lambda: self._test_sent())
+            except Exception as err:
+                self.app.post(lambda err=err: self._telegram_failed(err))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _test_sent(self):
+        self.btn_test_tg.config(state="normal")
+        self.lbl_tg.config(text="Test message sent - check Telegram.", foreground="#2a7")
 
     # -- helpers ----------------------------------------------------------- #
     def _toggle_secret(self):
@@ -579,6 +1109,19 @@ class SettingsDialog:
 
     def _set_status(self, text, color="#666"):
         self.lbl_status.config(text=text, foreground=color)
+
+    @staticmethod
+    def _tidy(value):
+        """1.0 -> '1', 0.5 -> '0.5' - spinboxes shouldn't show a pointless .0"""
+        return f"{float(value):g}"
+
+    @staticmethod
+    def _num(widget, default, lo, hi):
+        """Read a spinbox, falling back to the default if it was typed into."""
+        try:
+            return min(hi, max(lo, float(widget.get())))
+        except (ValueError, TypeError):
+            return default
 
     def _on_test(self):
         draft = self._draft_cfg()
@@ -634,8 +1177,8 @@ class SettingsDialog:
         def work():
             try:
                 data = api_get(draft, "/iot-open/sign/device/quota/all", {"sn": sn})
-                cands = soc_candidates(data)
-                self.app.post(lambda: self._soc_loaded(cands))
+                soc, grid = soc_candidates(data), grid_candidates(data)
+                self.app.post(lambda: (self._soc_loaded(soc), self._grid_loaded(grid)))
             except Exception as err:
                 self.app.post(lambda err=err: self._set_status(f"Field detect failed: {err}", "#c00"))
 
@@ -684,18 +1227,30 @@ class SettingsDialog:
             messagebox.showwarning(
                 APP_TITLE, "Click 'Test & load devices' and pick your device first.", parent=self.win)
             return
-        try:
-            refresh = max(10, int(float(self.sp_refresh.get())))
-        except ValueError:
-            refresh = DEFAULT_REFRESH
+        token, chat = self._telegram_draft()
+        if self.tg_enabled.get() and not (token and chat):
+            messagebox.showwarning(
+                APP_TITLE, "Telegram alerts need a bot token and a chat ID.\n"
+                           "Fill them in on the Notifications tab, or untick "
+                           "'Send Telegram alerts'.", parent=self.win)
+            return
         self.app.cfg = {
             "access_key": access,
             "secret_key": secret,
             "sn": sn,
             "device_name": name,
             "host": HOSTS[self.cb_region.get()],
-            "refresh_seconds": refresh,
+            "refresh_seconds": int(self._num(self.sp_refresh, DEFAULT_REFRESH, 10, 3600)),
             "soc_field": self._selected_soc_field(),
+            "telegram_enabled": bool(self.tg_enabled.get()),
+            "telegram_token": token,
+            "telegram_chat_id": chat,
+            "grid_field": self.cb_grid.get().strip() or DEFAULT_GRID_FIELD,
+            "grid_threshold": self._num(self.sp_thresh, DEFAULT_GRID_THRESHOLD, 0, 10 ** 6),
+            "outage_delay_min": self._num(self.sp_outage, DEFAULT_OUTAGE_DELAY_MIN, 0, 180),
+            "restore_delay_min": self._num(self.sp_restore, DEFAULT_RESTORE_DELAY_MIN, 0, 180),
+            "batt_alert_1": int(self._num(self.sp_batt1, DEFAULT_BATT_ALERT_1, 0, 100)),
+            "batt_alert_2": int(self._num(self.sp_batt2, DEFAULT_BATT_ALERT_2, 0, 100)),
         }
         save_config(self.app.cfg)
         try:
@@ -722,14 +1277,16 @@ class App:
         self.stop_event = threading.Event()
         self.refresh_event = threading.Event()
         self.ui_queue = queue.Queue()
-        self.state = {"soc": "--", "detail": "Not configured", "source": ""}
+        self.state = {"soc": "--", "detail": "Not configured", "source": "", "alerts": ""}
         self.settings_win = None
+        self.alerter = Alerter(lambda: self.cfg, self._on_alert_status)
 
         # Shared merged quota state, fed by HTTP (seed) and MQTT (live updates).
         self.quota = {}
         self.quota_lock = threading.Lock()
         self.mqtt = None
         self.last_live = 0.0     # time of last MQTT message
+        self.last_grid_live = 0.0  # time the AC-input field last arrived over MQTT
         self.force_http = False  # set by "Refresh now"
         self._last_icon_key = None  # (soc, charging) last rendered
 
@@ -746,6 +1303,8 @@ class App:
                 pystray.MenuItem(lambda i: f"Battery: {self.state['soc']}%", None, enabled=False),
                 pystray.MenuItem(lambda i: self.state["detail"], None, enabled=False),
                 pystray.MenuItem(lambda i: self.state.get("source") or "Connecting…", None, enabled=False),
+                pystray.MenuItem(lambda i: self.state.get("alerts"), None, enabled=False,
+                                 visible=lambda i: bool(self.state.get("alerts"))),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("Refresh now", self._on_refresh),
                 pystray.MenuItem("Settings...", self._on_settings, default=True),
@@ -789,6 +1348,7 @@ class App:
     def _on_quit(self, icon, item):
         self.stop_event.set()
         self.refresh_event.set()
+        self.alerter.stop()
         try:
             self.icon.stop()
         finally:
@@ -836,15 +1396,23 @@ class App:
                 self.quota.update(fields)
             quota = dict(self.quota)
         if soc_field in quota:  # avoid a 0% flash from a partial update
-            self._apply(reading_from_quota(quota, soc_field))
+            reading = reading_from_quota(quota, soc_field)
+            self._apply(reading)
+            self.alerter.observe(quota, reading)
 
     # -- MQTT callbacks (run on the paho thread) ------------------------- #
     def _on_mqtt_update(self, fields):
         self.last_live = time.time()
+        if self.cfg.get("grid_field", DEFAULT_GRID_FIELD) in fields:
+            self.last_grid_live = time.time()
         self._merge_and_apply(fields)
 
     def _on_mqtt_status(self, text):
         self.state["source"] = text
+        self.icon.update_menu()
+
+    def _on_alert_status(self, text):
+        self.state["alerts"] = text
         self.icon.update_menu()
 
     def start_mqtt(self):
@@ -860,6 +1428,8 @@ class App:
     def apply_new_config(self):
         with self.quota_lock:
             self.quota = {}          # drop state from a previous device
+        self.alerter.reset()         # don't alert on a change of device or field
+        self.state["alerts"] = ""
         self.force_http = True
         self.refresh_event.set()     # re-seed over HTTP right away
         self.start_mqtt()            # reconnect MQTT with the new keys/device
@@ -872,10 +1442,17 @@ class App:
                 with self.quota_lock:
                     have_data = soc_field in self.quota
                 mqtt_fresh = (time.time() - self.last_live) < max(120, 2 * refresh)
+                # AC-input fields ride on invStatus/pdStatus messages, which
+                # arrive far less often than bmsStatus (a few per minute on a
+                # DELTA 2 Max). A live MQTT feed therefore doesn't prove the
+                # outage signal is current, so fall back to HTTP for it while
+                # alerts are on - but only if it really has gone quiet.
+                grid_fresh = (time.time() - self.last_grid_live) < max(120, 2 * refresh)
+                need_grid = bool(self.cfg.get("telegram_enabled")) and not grid_fresh
                 force, self.force_http = self.force_http, False
                 # HTTP is a stale snapshot; use it only to seed, as a fallback
                 # when MQTT is silent, or when the user hits "Refresh now".
-                if force or not have_data or not mqtt_fresh:
+                if force or not have_data or not mqtt_fresh or need_grid:
                     try:
                         self._merge_and_apply(fetch_full_quota(self.cfg), replace=not have_data)
                     except Exception as err:
@@ -893,6 +1470,7 @@ class App:
         # update is applied to a live icon (not lost).
         icon.visible = True
         threading.Thread(target=self._worker, daemon=True).start()
+        self.alerter.start()
         if is_configured(self.cfg):
             self.start_mqtt()
 
