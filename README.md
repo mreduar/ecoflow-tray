@@ -19,7 +19,8 @@ device exposed through the official Developer API.
 - 🔒 **Keys stay local** — stored per-user in `%APPDATA%`, secret encrypted with Windows DPAPI
 
 <p align="center">
-  <img src="docs/screenshot.png" width="520" alt="EcoFlow Tray settings window">
+  <img src="docs/screenshot.png" width="420" alt="EcoFlow Tray settings — Device tab">
+  <img src="docs/screenshot-notifications.png" width="420" alt="EcoFlow Tray settings — Telegram notifications tab">
 </p>
 
 ---
