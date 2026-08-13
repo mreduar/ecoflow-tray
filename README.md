@@ -26,8 +26,7 @@ It was written against a DELTA 2 Max and works with any device the Developer API
 - Credentials kept per user in `%APPDATA%`, with the secret key and bot token encrypted at rest through Windows DPAPI.
 
 <p align="center">
-  <img src="docs/screenshot.png" width="420" alt="Settings, Device tab">
-  <img src="docs/screenshot-notifications.png" width="420" alt="Settings, Notifications tab">
+  <img src="docs/screenshot.png" width="560" alt="The Device tab of the Settings window">
 </p>
 
 ## Download
@@ -69,6 +68,10 @@ Alerts run entirely from your machine. You create your own bot, so there is no s
 
 To send to a group instead, add the bot to it, post any message there, and click Detect.
 
+<p align="center">
+  <img src="docs/screenshot-notifications.png" width="560" alt="The Notifications tab, showing the Telegram fields, the watched grid input field and the two battery levels">
+</p>
+
 | Setting | What it does |
 | --- | --- |
 | Grid input field | The field watched to decide whether grid power is present. Defaults to `inv.acInVol`, detected from your device, with its live value shown underneath. If your unit offers `bms_emsStatus.chgLinePlug` ("AC cable connected", zero against non-zero), that is the most reliable choice of all. |
@@ -91,6 +94,10 @@ Both naming generations are recognised: `inv.acInVol`, `inv.inputWatts` and `pd.
 The four events that send a Telegram message can also start something on this PC: a shortcut, an executable, a batch file or a script. Point the **Power outage** slot at the `.lnk` you already double-click and it will run the moment the mains go.
 
 Open **Settings → Executions**, tick **Run programs on these events**, fill in the slots you care about, and save. An empty **Program** box means that event does nothing.
+
+<p align="center">
+  <img src="docs/screenshot-executions.png" width="560" alt="The Executions tab, with a program slot for each of the four events">
+</p>
 
 | Setting | What it does |
 | --- | --- |
