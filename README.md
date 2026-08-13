@@ -12,6 +12,7 @@ device exposed through the official Developer API.
 - 🟢 **Live tray icon** — color-coded: green (high), amber/orange (low), red (<15%), cyan (charging)
 - ⚡ **Real-time updates over MQTT** — pushed live from EcoFlow's broker; the number keeps moving **without keeping the phone app open**
 - 📲 **Telegram alerts** — get a message when the grid power drops and when it comes back, plus two battery-level warnings. You run your own bot; there's no server in the middle
+- ▶️ **Run your own programs** — the same four events can launch a `.lnk`, `.exe`, `.bat` or `.vbs` of yours, each with its own delay, so a power cut can drive whatever automation you already have
 - 🖱️ **Right-click menu** — status, power in/out, time remaining, refresh, settings, quit
 - ⚙️ **Settings UI** — enter your API keys, pick your device, set the polling interval; no file editing
 - 🔋 **Smart battery-field detection** — reads your device's live data and lets you pick the value that matches the EcoFlow app (any model), with a custom option
@@ -125,6 +126,49 @@ unplug it, and adjust the threshold if it doesn't.
   time the event happened, not the time it was finally delivered.
 - Alerts are driven by live readings, so if the app can't reach EcoFlow at all
   it has nothing to act on.
+
+## Executions — run a program when the power goes
+
+The same four events that send a Telegram message can also launch something on
+this PC: a shortcut, an executable, a batch file or a script. Point the **Power
+outage** slot at the `.lnk` you already double-click and the app will run it for
+you the moment the mains go.
+
+Open **Settings → Executions**, tick **Run programs on these events**, fill in
+the slots you care about and Save. An empty **Program** box means that event
+does nothing.
+
+| Setting | What it does |
+| --- | --- |
+| **Run after (minutes)** | The execution delays, **separate from the Telegram ones**. `0` runs the program as soon as the change is noticed (within 10 seconds) — so you can act immediately and still get the message a minute later, once the outage has proven real. |
+| **Program** | The thing to launch. **Browse…** filters for `.lnk .exe .bat .cmd .vbs .ps1`, but any file with an association works — it is launched exactly as a double click would, which is why Windows shortcuts and `.vbs` scripts work at all. |
+| **Arguments** | Optional. Passed straight to the program, not through a shell (so `&`, `\|` and `>` are literal text). |
+| **Run now** | Launches what is currently typed in the boxes, without saving — the quickest way to check a path before you rely on it. |
+
+**Placeholders.** Arguments may contain `{event}` (`outage`, `restore`, `batt1`
+or `batt2`), `{soc}`, `{device}`, `{watts_in}`, `{watts_out}` and `{time}`. A
+name that isn't on that list is left in place, so a typo shows up in the command
+line rather than blowing anything up. Nothing is quoted for you: if a value can
+contain spaces — `{device}` usually does — write the quotes yourself, e.g.
+`--name "{device}" --soc {soc}`.
+
+**Worth knowing**
+
+- With a `0` delay a grid that flickers runs the outage program and then the
+  restore program back to back. Set a minute if that would be a problem.
+- If both battery levels are the same, both slots run at once (you still get one
+  Telegram message).
+- Saving Settings during an outage clears the pending event, so an alert or a
+  program that was waiting out its delay is discarded.
+- A program that fails to start shows up as `Run: …` in the tray menu; the app
+  keeps monitoring regardless.
+
+> **Security.** This runs programs of your choosing with your Windows account,
+> without asking, from paths stored in `%APPDATA%\EcoFlowTray\config.json`. That
+> is the same trust you already give the `HKCU\…\Run` entry the app writes for
+> "Start with Windows" — but anything that can edit that config file can decide
+> what runs when the lights go out. Only point these slots at things you wrote
+> or trust.
 
 ## Start with Windows
 

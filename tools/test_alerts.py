@@ -2,7 +2,8 @@
 
 No network, no device, no Windows needed: the Windows/GUI modules are stubbed,
 so this runs anywhere. Covers grid-outage debouncing, battery thresholds, the
-Telegram retry queue, and AC-input field detection across EcoFlow generations.
+Telegram retry queue, program executions, and AC-input field detection across
+EcoFlow generations.
 
 Usage:
     python3 tools/test_alerts.py
@@ -13,6 +14,7 @@ import json
 import pathlib
 import sys
 import tempfile
+import threading
 import types
 import urllib.error
 
@@ -31,6 +33,11 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import time  # noqa: E402  (after the stubs, so the module import below works)
 
 import ecoflow_tray as et  # noqa: E402
+
+# Module level, not per test: test_gating builds its Alerter by hand, so a local
+# stub wouldn't cover it - and nothing here may ever launch a real program.
+RUNS = []
+et.run_command = lambda path, args="": RUNS.append((path, args))
 
 FAILS = []
 
@@ -104,6 +111,32 @@ def alerter():
     a = et.Alerter(lambda: CFG)
     a._queue = lambda text, now: SENT.append(text)
     return a
+
+
+def exec_alerter(**over):
+    """An Alerter with executions on and a program in every slot."""
+    del SENT[:]
+    del RUNS[:]
+    cfg = dict(CFG, exec_enabled=True,
+               exec_outage_delay_min=0, exec_restore_delay_min=0)
+    cfg.update({f"exec_{k}_path": f"{k}.lnk" for k in et.EXEC_KINDS})
+    cfg.update({f"exec_{k}_args": "" for k in et.EXEC_KINDS})
+    cfg.update(over)
+    a = et.Alerter(lambda: cfg)
+    a._queue = lambda text, now: SENT.append(text)
+    return a
+
+
+def settle():
+    """Wait for the launcher threads _launch spawns."""
+    for t in threading.enumerate():
+        if t.name.startswith("exec-"):
+            t.join(timeout=2)
+
+
+def ran():
+    settle()
+    return [path for path, _ in RUNS]
 
 
 def feed(a, *, volts, soc, at):
@@ -219,8 +252,89 @@ def test_gating():
     feed(a, volts=OFF, soc=90, at=T0 + 200)
     feed(a, volts=OFF, soc=90, at=T0 + 400)
     check("nothing queued while off", a.outbox, [])
-    check("but state is still tracked", a.grid, False)
+    check("but state is still tracked", a.grid["alert"], False)
     CFG["telegram_enabled"] = True
+
+
+# --------------------------------------------------------------------------- #
+# Running local programs
+# --------------------------------------------------------------------------- #
+def test_exec_independent_delay():
+    section("executions: their own delay")
+    a = exec_alerter(outage_delay_min=2, exec_outage_delay_min=0)
+    feed(a, volts=ON, soc=90, at=T0)
+    feed(a, volts=OFF, soc=90, at=T0 + 10)
+    tick(a, T0 + 11)
+    check("the program runs at once", ran(), ["outage.lnk"])
+    check("telegram is still waiting", SENT, [])
+    tick(a, T0 + 140)
+    check("the alert fires at 2 min", len(SENT), 1)
+    check("the program did not run twice", len(ran()), 1)
+
+
+def test_exec_flicker_independent():
+    section("executions: a flicker with a 0 delay")
+    a = exec_alerter(outage_delay_min=2, restore_delay_min=2)
+    feed(a, volts=ON, soc=90, at=T0)
+    feed(a, volts=OFF, soc=90, at=T0 + 10)
+    tick(a, T0 + 11)
+    feed(a, volts=ON, soc=90, at=T0 + 20)      # back before the alert delay
+    tick(a, T0 + 21)
+    check("both slots ran", ran(), ["outage.lnk", "restore.lnk"])
+    check("telegram stayed quiet", SENT, [])
+
+
+def test_exec_disabled():
+    section("executions: switched off")
+    a = exec_alerter(exec_enabled=False)
+    feed(a, volts=ON, soc=90, at=T0)
+    feed(a, volts=OFF, soc=90, at=T0 + 10)
+    tick(a, T0 + 11)
+    check("nothing launched", ran(), [])
+    check("but state is still tracked", a.grid["exec"], False)
+
+
+def test_exec_empty_path():
+    section("executions: an empty slot")
+    a = exec_alerter(exec_outage_path="")
+    feed(a, volts=ON, soc=90, at=T0)
+    feed(a, volts=OFF, soc=90, at=T0 + 10)
+    tick(a, T0 + 11)
+    check("an empty path is simply off", ran(), [])
+
+
+def test_exec_battery_slots():
+    section("executions: battery slots")
+    a = exec_alerter()
+    feed(a, volts=OFF, soc=80, at=T0)
+    feed(a, volts=OFF, soc=10, at=T0 + 60)     # steep drop past both levels
+    check("still one message", len(SENT), 1)
+    check("but both slots ran", sorted(ran()), ["batt1.lnk", "batt2.lnk"])
+
+
+def test_exec_reset_is_silent():
+    section("executions: reset re-adopts silently")
+    a = exec_alerter()
+    feed(a, volts=ON, soc=90, at=T0)
+    a.reset()                                   # e.g. Settings saved, or a reboot
+    feed(a, volts=OFF, soc=90, at=T0 + 10)
+    tick(a, T0 + 20)
+    check("nothing launched after a reset", ran(), [])
+    check("nothing sent after a reset", SENT, [])
+
+
+def test_render_args():
+    section("argument placeholders")
+    vals = et.exec_values("outage", {"soc": 42, "watts_in": 0, "watts_out": 120},
+                          "DELTA 2 Max", T0)
+    check("known keys are substituted",
+          et.render_args('--soc {soc} --dev "{device}"', vals),
+          '--soc 42 --dev "DELTA 2 Max"')
+    check("the event name is available", et.render_args("{event}", vals), "outage")
+    check("a typo is left alone", et.render_args("{sock}", vals), "{sock}")
+    check("stray braces survive", et.render_args("50% { {} }", vals), "50% { {} }")
+    check("every key is present", sorted(vals),
+          ["device", "event", "soc", "time", "watts_in", "watts_out"])
 
 
 # --------------------------------------------------------------------------- #
@@ -319,17 +433,27 @@ def test_config_roundtrip():
     et.save_config({"access_key": "AK", "secret_key": "SK", "sn": "SN",
                     "telegram_token": "123:abc", "telegram_chat_id": "42",
                     "telegram_enabled": True, "outage_delay_min": 7,
-                    "batt_alert_1": 25})
+                    "batt_alert_1": 25, "exec_enabled": True,
+                    "exec_outage_path": r"C:\tools\lights.lnk",
+                    "exec_outage_args": "--soc {soc}",
+                    "exec_outage_delay_min": 2})
     back = et.load_config()
     check("token round-trips", back["telegram_token"], "123:abc")
     check("delay round-trips", back["outage_delay_min"], 7.0)
     check("battery level round-trips", back["batt_alert_1"], 25)
     check("defaults fill in", back["restore_delay_min"], et.DEFAULT_RESTORE_DELAY_MIN)
+    check("exec path round-trips", back["exec_outage_path"], r"C:\tools\lights.lnk")
+    check("exec args round-trip", back["exec_outage_args"], "--soc {soc}")
+    check("exec delay round-trips", back["exec_outage_delay_min"], 2.0)
+    check("exec defaults fill in", back["exec_batt1_path"], "")
 
 
 def main():
     for test in (test_field_detection, test_outage_debounce, test_zero_delay,
                  test_tick_ages_out, test_battery_levels, test_gating,
+                 test_exec_independent_delay, test_exec_flicker_independent,
+                 test_exec_disabled, test_exec_empty_path, test_exec_battery_slots,
+                 test_exec_reset_is_silent, test_render_args,
                  test_telegram_api, test_retry_queue, test_config_roundtrip):
         test()
     print("\n" + ("ALL PASS" if not FAILS else f"{len(FAILS)} FAILED: {FAILS}"))

@@ -8,6 +8,9 @@ polling interval) and Quit.
 Optionally sends Telegram alerts when grid power is lost or restored, and when
 the battery drops past two configurable levels. Each user supplies their own bot
 token, so no server is involved - alerts are plain HTTPS calls to the Bot API.
+The same four events can launch a local program (an .exe, a .bat or a Windows
+.lnk shortcut), each with its own delay, so a power cut can drive whatever
+automation the user already has.
 
 Credentials are stored per-user in %APPDATA%\\EcoFlowTray\\config.json. The secret
 key and bot token are encrypted at rest with Windows DPAPI (tied to the current
@@ -28,6 +31,7 @@ import json
 import os
 import queue
 import random
+import re
 import sys
 import threading
 import time
@@ -39,7 +43,7 @@ from ctypes import wintypes
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 import paho.mqtt.client as mqtt
 import pystray
@@ -67,6 +71,21 @@ DEFAULT_OUTAGE_DELAY_MIN = 1.0
 DEFAULT_RESTORE_DELAY_MIN = 1.0
 DEFAULT_BATT_ALERT_1 = 30
 DEFAULT_BATT_ALERT_2 = 15
+
+# Running local programs on the same four events. Each event ("kind") owns one
+# path + arguments slot; each channel confirms the grid signal on its own delay,
+# so a program can run at once while the Telegram message waits a minute.
+EXEC_KINDS = ("outage", "restore", "batt1", "batt2")
+CHANNELS = ("alert", "exec")
+BATT_KIND = {"batt_alert_1": "batt1", "batt_alert_2": "batt2"}
+DEFAULT_EXEC_OUTAGE_DELAY_MIN = 0.0
+DEFAULT_EXEC_RESTORE_DELAY_MIN = 0.0
+DELAY_DEFAULTS = {
+    "outage_delay_min": DEFAULT_OUTAGE_DELAY_MIN,
+    "restore_delay_min": DEFAULT_RESTORE_DELAY_MIN,
+    "exec_outage_delay_min": DEFAULT_EXEC_OUTAGE_DELAY_MIN,
+    "exec_restore_delay_min": DEFAULT_EXEC_RESTORE_DELAY_MIN,
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -132,6 +151,11 @@ CONFIG_DEFAULTS = {
     "restore_delay_min": DEFAULT_RESTORE_DELAY_MIN,
     "batt_alert_1": DEFAULT_BATT_ALERT_1,
     "batt_alert_2": DEFAULT_BATT_ALERT_2,
+    "exec_enabled": False,
+    "exec_outage_delay_min": DEFAULT_EXEC_OUTAGE_DELAY_MIN,
+    "exec_restore_delay_min": DEFAULT_EXEC_RESTORE_DELAY_MIN,
+    # an empty path turns that slot off
+    **{f"exec_{kind}_{part}": "" for kind in EXEC_KINDS for part in ("path", "args")},
 }
 
 
@@ -168,7 +192,17 @@ def save_config(cfg: dict) -> None:
         "restore_delay_min": float(cfg.get("restore_delay_min", DEFAULT_RESTORE_DELAY_MIN)),
         "batt_alert_1": int(cfg.get("batt_alert_1", DEFAULT_BATT_ALERT_1)),
         "batt_alert_2": int(cfg.get("batt_alert_2", DEFAULT_BATT_ALERT_2)),
+        "exec_enabled": bool(cfg.get("exec_enabled", False)),
+        "exec_outage_delay_min": float(
+            cfg.get("exec_outage_delay_min", DEFAULT_EXEC_OUTAGE_DELAY_MIN)),
+        "exec_restore_delay_min": float(
+            cfg.get("exec_restore_delay_min", DEFAULT_EXEC_RESTORE_DELAY_MIN)),
     }
+    # Coerced to str: a hand-edited config with a number here would otherwise
+    # blow up inside the launcher thread, where nobody sees the traceback.
+    for kind in EXEC_KINDS:
+        for part in ("path", "args"):
+            out[f"exec_{kind}_{part}"] = str(cfg.get(f"exec_{kind}_{part}", "") or "")
     for name in _SECRET_FIELDS:
         value = cfg.get(name, "")
         enc = dpapi_encrypt(value) if value else None
@@ -181,6 +215,11 @@ def save_config(cfg: dict) -> None:
 
 def is_configured(cfg: dict) -> bool:
     return bool(cfg.get("access_key") and cfg.get("secret_key") and cfg.get("sn"))
+
+
+def watching_grid(cfg: dict) -> bool:
+    """True while anything acts on the AC-input field, so it must stay fresh."""
+    return bool(cfg.get("telegram_enabled") or cfg.get("exec_enabled"))
 
 
 # --------------------------------------------------------------------------- #
@@ -532,10 +571,82 @@ def telegram_detect_chat(token):
 
 
 # --------------------------------------------------------------------------- #
+# Running local programs on power events
+# The user picks a program per event; the app launches it exactly as a double
+# click would, so Windows shortcuts and script associations both work.
+# --------------------------------------------------------------------------- #
+def resolve_command_path(path):
+    """The absolute path run_command would actually launch.
+
+    "Copy as path" in Explorer wraps the path in quotes, and a process started
+    from the HKCU Run key has its CWD in C:\\Windows\\system32 - so a relative
+    path saved from a dev run would resolve somewhere else entirely.
+    """
+    return os.path.abspath(os.path.expanduser(os.path.expandvars(str(path).strip().strip('"'))))
+
+
+def run_command(path, args=""):
+    """Launch path the way a double click would.
+
+    ShellExecute is the only thing that resolves .lnk shortcuts and script
+    associations like .vbs - CreateProcess, which is what subprocess uses,
+    can do neither.
+    """
+    if not hasattr(os, "startfile"):
+        raise RuntimeError("Launching programs is only supported on Windows")
+    target = resolve_command_path(path)
+    # a .lnk carries its own "Start in" folder; passing cwd would override it
+    cwd = None if target.lower().endswith(".lnk") else (os.path.dirname(target) or None)
+    os.startfile(target, arguments=args, cwd=cwd)
+
+
+def _co_initialize():
+    """Give the calling thread a COM apartment.
+
+    ShellExecute resolves a .lnk through COM. Harmless when one already exists.
+    """
+    try:
+        ctypes.windll.ole32.CoInitializeEx(None, 2)   # COINIT_APARTMENTTHREADED
+    except Exception:
+        pass
+
+
+_PLACEHOLDER = re.compile(r"\{(\w+)\}")
+
+
+def render_args(args, values):
+    """Substitute {name} placeholders, leaving anything else untouched.
+
+    Deliberately not str.format: that raises KeyError on an unknown name,
+    ValueError on a stray brace and IndexError on "{}". Here a typo simply
+    survives into the command line, where the user can see it.
+    """
+    return _PLACEHOLDER.sub(lambda m: str(values.get(m.group(1), m.group(0))), str(args or ""))
+
+
+def exec_values(event, reading, device, when):
+    """The placeholder dict for render_args - always every key, "" where unknown.
+
+    {time} uses a format without spaces so it can't split one argument in two.
+    """
+    reading = reading or {}
+    return {
+        "event": event,
+        "soc": reading.get("soc", ""),
+        "device": device or "",
+        "watts_out": reading.get("watts_out", ""),
+        "watts_in": reading.get("watts_in", ""),
+        "time": time.strftime("%Y-%m-%dT%H:%M", time.localtime(when)),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Alerting - debounced grid-outage and battery-level notifications
 # The house losing power usually takes the router down too, so a send can fail
 # for reasons that have nothing to do with the message. Alerts are queued and
 # retried, and each one carries the timestamp of the event, not of the send.
+# The same events also drive the user's local programs, which need no network
+# and so run on their own (usually much shorter) delays.
 # --------------------------------------------------------------------------- #
 def _fmt_duration(seconds):
     minutes = max(0, int(seconds // 60))
@@ -559,11 +670,15 @@ def _alert_body(reading):
 
 
 class Alerter:
-    """Watches AC input and battery level, and pushes Telegram alerts.
+    """Watches AC input and battery level, pushes Telegram alerts and launches
+    the user's programs.
 
     Transitions must hold for the user's configured delay before they count, so
-    a brief flicker doesn't fire an alert. State is tracked even while Telegram
-    is off, so enabling it never dumps a backlog of stale events.
+    a brief flicker doesn't fire anything. The raw signal is shared, but each
+    channel ("alert" and "exec") confirms it on its own delay - that is how a
+    program can run immediately while the message waits a minute. State is
+    tracked even while Telegram and executions are off, so enabling one never
+    dumps a backlog of stale events.
     """
 
     TICK_SECONDS = 10
@@ -575,13 +690,18 @@ class Alerter:
         self.get_cfg = get_cfg
         self.on_status = on_status or (lambda text: None)
         self.lock = threading.Lock()
+        # evaluate() runs from three threads (paho, the HTTP worker and the tick
+        # loop below). Without this a duplicate Telegram message was the worst
+        # case; with executions it would launch a program twice.
+        # Lock order: eval_lock is ALWAYS taken before self.lock, never after.
+        self.eval_lock = threading.Lock()
         self.stop_event = threading.Event()
         self.outbox = []          # [{"text", "created", "tries", "next_try"}]
         self.latest = None        # (reading, grid_present) from the last update
-        self.grid = None          # confirmed grid state: True / False / None
-        self.grid_since = 0.0
-        self.pending = None       # candidate state waiting out its delay
-        self.pending_since = 0.0
+        self.raw = None           # last instantaneous grid state seen
+        self.raw_since = 0.0      # when that value first showed up
+        self.grid = {}            # {channel: confirmed grid state}
+        self.grid_since = {}      # {channel: when that confirmed state began}
         self.batt_armed = {}      # {config key: bool}
         self.batt_level = {}      # {config key: threshold it was armed at}
 
@@ -592,10 +712,16 @@ class Alerter:
         self.stop_event.set()
 
     def reset(self):
-        """Forget tracked state (device or watched field changed)."""
-        with self.lock:
+        """Forget tracked state (device or watched field changed).
+
+        All four grid fields go together: "raw is None" must mean "both dicts
+        are empty", or _grid_events raises KeyError inside observe() - and
+        EcoflowMqtt swallows that, leaving the tray silently frozen.
+        """
+        with self.eval_lock, self.lock:
             self.latest = None
-            self.grid = self.pending = None
+            self.raw, self.raw_since = None, 0.0
+            self.grid, self.grid_since = {}, {}
             self.batt_armed.clear()
             self.batt_level.clear()
 
@@ -618,38 +744,74 @@ class Alerter:
         reading, present = snapshot
         cfg, now = self.get_cfg(), time.time()
         device = cfg.get("device_name") or "EcoFlow"
-        for text in self._grid_events(present, reading, device, cfg, now) + \
-                self._battery_events(reading, device, cfg):
-            self._queue(text, now)
+        launches = []
+        with self.eval_lock:
+            fresh = self._track_raw(present, now)
+            if not fresh:      # never fire on the observation that starts a transition
+                event = self._grid_events("alert", cfg, now)
+                if event:
+                    self._queue(self._grid_text(event, reading, device), now)
+                event = self._grid_events("exec", cfg, now)
+                if event:
+                    launches.append(event[0])
+            for kinds, text in self._battery_events(reading, device, cfg, now):
+                self._queue(text, now)
+                launches.extend(kinds)
+        # Outside the lock on purpose: ShellExecute can block on a shortcut that
+        # points at a dead network share, on UAC or on the "how do you want to
+        # open this file?" dialog. Holding eval_lock there would stall observe()
+        # on the paho thread and stop the MQTT network loop.
+        for kind in launches:
+            self._launch(kind, reading, cfg, now)
 
-    def _grid_events(self, present, reading, device, cfg, now):
-        if present is None:
-            return []
-        if self.grid is None:                      # first reading: adopt silently
-            self.grid, self.grid_since, self.pending = present, now, None
-            return []
-        if present == self.grid:
-            self.pending = None
-            return []
-        if self.pending != present:                # transition just started
-            self.pending, self.pending_since = present, now
-            return []
-        key = "restore_delay_min" if present else "outage_delay_min"
-        default = DEFAULT_RESTORE_DELAY_MIN if present else DEFAULT_OUTAGE_DELAY_MIN
-        if now - self.pending_since < 60 * float(cfg.get(key, default)):
-            return []
-        began = self.pending_since                 # the event, not its confirmation
-        held = began - self.grid_since
-        self.grid, self.grid_since, self.pending = present, began, None
-        if present:
-            return [f"🟢 <b>Power restored</b>\n{html.escape(device)} is back on grid power.\n"
-                    f"{_alert_body(reading)}\nOutage lasted {_fmt_duration(held)} · {_fmt_clock(began)}"]
-        return [f"🔴 <b>Power outage</b>\n{html.escape(device)} is running on battery.\n"
-                f"{_alert_body(reading)}\n{_fmt_clock(began)}"]
+    def _track_raw(self, present, now):
+        """Record the instantaneous reading; True if it just changed."""
+        if present is None or present == self.raw:
+            return False
+        first = self.raw is None
+        self.raw, self.raw_since = present, now
+        if first:                                  # first reading: adopt silently
+            self.grid = {ch: present for ch in CHANNELS}
+            self.grid_since = {ch: now for ch in CHANNELS}
+        return True
 
-    def _battery_events(self, reading, device, cfg):
+    def _grid_events(self, channel, cfg, now):
+        """(kind, began, held) once the raw state has outlasted this channel's
+        delay, else None.
+
+        Pure state - the caller formats the text. Flicker cancellation comes for
+        free: raw_since restarts on every flip, so leaving and re-entering the
+        confirmed state restarts the countdown.
+        """
+        if self.raw is None or self.raw == self.grid[channel]:
+            return None
+        prefix = "" if channel == "alert" else "exec_"
+        key = f"{prefix}{'restore' if self.raw else 'outage'}_delay_min"
+        if now - self.raw_since < 60 * float(cfg.get(key, DELAY_DEFAULTS[key])):
+            return None
+        began = self.raw_since                     # the event, not its confirmation
+        held = began - self.grid_since[channel]
+        self.grid[channel], self.grid_since[channel] = self.raw, began
+        return ("restore" if self.raw else "outage"), began, held
+
+    @staticmethod
+    def _grid_text(event, reading, device):
+        kind, began, held = event
+        if kind == "restore":
+            return (f"🟢 <b>Power restored</b>\n{html.escape(device)} is back on grid power.\n"
+                    f"{_alert_body(reading)}\nOutage lasted {_fmt_duration(held)} · {_fmt_clock(began)}")
+        return (f"🔴 <b>Power outage</b>\n{html.escape(device)} is running on battery.\n"
+                f"{_alert_body(reading)}\n{_fmt_clock(began)}")
+
+    def _battery_events(self, reading, device, cfg, now):
+        """[(kinds, text)] - one message, but every crossed slot to launch.
+
+        Battery levels are instantaneous crossings shared by both channels, so
+        they have no delay of their own. The kind travels with the level because
+        nothing stops the user from setting alert 1 lower than alert 2.
+        """
         soc, crossed = reading["soc"], []
-        for key in ("batt_alert_1", "batt_alert_2"):
+        for key, kind in BATT_KIND.items():
             try:
                 level = int(cfg.get(key, 0) or 0)
             except (TypeError, ValueError):
@@ -662,15 +824,36 @@ class Alerter:
                 continue
             if self.batt_armed.get(key) and soc <= level:
                 self.batt_armed[key] = False
-                crossed.append(level)
+                crossed.append((level, kind))
             elif not self.batt_armed.get(key) and soc >= level + self.REARM_MARGIN:
                 self.batt_armed[key] = True
         if not crossed:
             return []
-        level = min(crossed)  # a steep drop past both thresholds is still one alert
+        level, _ = min(crossed)  # a steep drop past both thresholds is still one alert
         icon = "🪫" if level <= 20 else "⚠️"
-        return [f"{icon} <b>Battery at {soc}%</b>\n{html.escape(device)} dropped below {level}%.\n"
-                f"{_alert_body(reading)}\n{_fmt_clock(time.time())}"]
+        text = (f"{icon} <b>Battery at {soc}%</b>\n{html.escape(device)} dropped below {level}%.\n"
+                f"{_alert_body(reading)}\n{_fmt_clock(now)}")
+        return [([kind for _, kind in crossed], text)]
+
+    # -- launching --------------------------------------------------------- #
+    def _launch(self, kind, reading, cfg, now):
+        if not cfg.get("exec_enabled"):
+            return
+        path = str(cfg.get(f"exec_{kind}_path", "") or "").strip()
+        if not path:                               # empty path = slot off
+            return
+        device = cfg.get("device_name") or "EcoFlow"
+        args = render_args(cfg.get(f"exec_{kind}_args", ""),
+                           exec_values(kind, reading, device, now))
+
+        def work():
+            try:
+                _co_initialize()
+                run_command(path, args)
+            except Exception as err:
+                self.on_status(f"Run: {kind} failed ({err})")
+
+        threading.Thread(target=work, name=f"exec-{kind}", daemon=True).start()
 
     # -- delivery ---------------------------------------------------------- #
     def _queue(self, text, now):
@@ -894,6 +1077,7 @@ class SettingsDialog:
         row += 1
 
         self._build_notifications_tab(nb)
+        self._build_executions_tab(nb)
 
         btns = ttk.Frame(win, padding=(16, 10))
         btns.grid(row=1, column=0, sticky="e")
@@ -1004,6 +1188,148 @@ class SettingsDialog:
 
         ttk.Label(frm, text="Alerts fire when the battery drops past a level. 0 turns one off.",
                   foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w")
+
+    # -- executions tab ---------------------------------------------------- #
+    def _build_executions_tab(self, nb):
+        cfg = self.app.cfg
+        frm = ttk.Frame(nb, padding=16)
+        frm.columnconfigure(0, weight=1)
+        nb.add(frm, text="Executions")
+        self.exec_w = {}    # {kind: {"path": Entry, "args": Entry, "run": Button}}
+        row = 0
+
+        self.exec_enabled = tk.BooleanVar(value=bool(cfg.get("exec_enabled")))
+        ttk.Checkbutton(frm, text="Run programs on these events", variable=self.exec_enabled)\
+            .grid(row=row, column=0, sticky="w", pady=(0, 6))
+        row += 1
+
+        # Both delays share a row: the Notebook takes the height of its tallest
+        # tab, and the window is not resizable.
+        delays = ttk.Frame(frm)
+        delays.grid(row=row, column=0, sticky="w", pady=(0, 6))
+        ttk.Label(delays, text="Run after (minutes)").grid(row=0, column=0, sticky="w")
+        self.sp_exec_outage = ttk.Spinbox(delays, from_=0, to=180, increment=1, width=5)
+        self.sp_exec_outage.set(
+            self._tidy(cfg.get("exec_outage_delay_min", DEFAULT_EXEC_OUTAGE_DELAY_MIN)))
+        self.sp_exec_outage.grid(row=0, column=1, padx=(8, 4))
+        ttk.Label(delays, text="without power").grid(row=0, column=2, sticky="w")
+        self.sp_exec_restore = ttk.Spinbox(delays, from_=0, to=180, increment=1, width=5)
+        self.sp_exec_restore.set(
+            self._tidy(cfg.get("exec_restore_delay_min", DEFAULT_EXEC_RESTORE_DELAY_MIN)))
+        self.sp_exec_restore.grid(row=0, column=3, padx=(14, 4))
+        ttk.Label(delays, text="with power back").grid(row=0, column=4, sticky="w")
+        row += 1
+
+        titles = {
+            "outage": "Power outage",
+            "restore": "Power restored",
+            "batt1": f"Battery alert 1 ({cfg.get('batt_alert_1', DEFAULT_BATT_ALERT_1)}%)",
+            "batt2": f"Battery alert 2 ({cfg.get('batt_alert_2', DEFAULT_BATT_ALERT_2)}%)",
+        }
+        for kind in EXEC_KINDS:
+            self._exec_slot(frm, kind, titles[kind], row)
+            row += 1
+
+        # One shared status line, again to keep the tab short.
+        self.lbl_exec = ttk.Label(frm, text="", foreground="#666", wraplength=440, justify="left")
+        self.lbl_exec.grid(row=row, column=0, sticky="w", pady=(4, 2))
+        row += 1
+
+        ttk.Label(frm, justify="left", foreground="#888", wraplength=440,
+                  text="An empty program turns that event off. Arguments accept {event}, "
+                       "{soc}, {device}, {watts_in}, {watts_out} and {time}; add your own "
+                       "quotes if a value may contain spaces.\n"
+                       "0 minutes means “as soon as it is noticed” (within 10 s), so "
+                       "a flickering grid runs the outage and the restore program back to "
+                       "back — set a minute if that matters. If both battery levels are "
+                       "equal, both slots run at once.\n"
+                       "Saving Settings during an outage clears the pending event.")\
+            .grid(row=row, column=0, sticky="w")
+
+        self._check_exec_paths()
+
+    def _exec_slot(self, parent, kind, title, row):
+        cfg = self.app.cfg
+        box = ttk.LabelFrame(parent, text=title, padding=(8, 2, 8, 6))
+        box.grid(row=row, column=0, sticky="ew", pady=3)
+        box.columnconfigure(1, weight=1)
+
+        ttk.Label(box, text="Program", width=10).grid(row=0, column=0, sticky="w", pady=2)
+        e_path = ttk.Entry(box, width=42)
+        e_path.insert(0, cfg.get(f"exec_{kind}_path", ""))
+        e_path.grid(row=0, column=1, sticky="ew", pady=2)
+        e_path.bind("<FocusOut>", lambda e: self._check_exec_paths())
+        ttk.Button(box, text="Browse…", width=9, command=lambda: self._browse_exec(kind))\
+            .grid(row=0, column=2, sticky="w", padx=(8, 0))
+
+        ttk.Label(box, text="Arguments", width=10).grid(row=1, column=0, sticky="w", pady=2)
+        e_args = ttk.Entry(box, width=42)
+        e_args.insert(0, cfg.get(f"exec_{kind}_args", ""))
+        e_args.grid(row=1, column=1, sticky="ew", pady=2)
+        btn = ttk.Button(box, text="Run now", width=9, command=lambda: self._on_run_now(kind))
+        btn.grid(row=1, column=2, sticky="w", padx=(8, 0))
+
+        self.exec_w[kind] = {"path": e_path, "args": e_args, "run": btn}
+
+    def _exec_paths(self):
+        return {kind: w["path"].get().strip() for kind, w in self.exec_w.items()}
+
+    def _check_exec_paths(self):
+        """Warn about programs that aren't there - never block on it, the drive
+        may simply be unplugged right now."""
+        missing = [k for k, p in self._exec_paths().items()
+                   if p and not os.path.exists(resolve_command_path(p))]
+        if missing:
+            self.lbl_exec.config(text=f"Not found right now: {', '.join(missing)}. "
+                                      "Saved anyway - check the path if that's a surprise.",
+                                 foreground="#c60")
+        elif self.lbl_exec.cget("foreground") == "#c60":
+            self.lbl_exec.config(text="", foreground="#666")
+
+    def _browse_exec(self, kind):
+        path = filedialog.askopenfilename(
+            parent=self.win, title="Pick a program or shortcut",
+            filetypes=[("Programs and shortcuts", "*.lnk *.exe *.bat *.cmd *.vbs *.ps1"),
+                       ("All files", "*.*")])
+        if path:
+            entry = self.exec_w[kind]["path"]
+            entry.delete(0, tk.END)
+            entry.insert(0, os.path.normpath(path))
+            self._check_exec_paths()
+
+    def _on_run_now(self, kind):
+        """Launch what's typed in the widgets right now - not what's saved, so
+        the user can try a path before committing to it."""
+        path = self.exec_w[kind]["path"].get().strip()
+        if not path:
+            self.lbl_exec.config(text="Pick a program for this event first.", foreground="#c00")
+            return
+        snapshot = self.app.alerter.latest
+        device = self.app.cfg.get("device_name") or "EcoFlow"
+        args = render_args(self.exec_w[kind]["args"].get(),
+                           exec_values(kind, snapshot[0] if snapshot else None,
+                                       device, time.time()))
+        btn = self.exec_w[kind]["run"]
+        btn.config(state="disabled")
+        self.lbl_exec.config(text="Launching…", foreground="#666")
+
+        def work():
+            try:
+                _co_initialize()
+                run_command(path, args)
+                self.app.post(lambda: self._run_done(kind, None))
+            except Exception as err:
+                self.app.post(lambda err=err: self._run_done(kind, err))
+
+        threading.Thread(target=work, name=f"exec-{kind}", daemon=True).start()
+
+    def _run_done(self, kind, err):
+        self.exec_w[kind]["run"].config(state="normal")
+        if err:
+            self.lbl_exec.config(text=f"Failed: {err}", foreground="#c00")
+        else:
+            self.lbl_exec.config(text=f"Launched the {kind} program — check it did what "
+                                      "you expect.", foreground="#2a7")
 
     def _toggle_token(self):
         self.e_token.config(show="" if self.tg_show.get() else "\u2022")
@@ -1234,6 +1560,13 @@ class SettingsDialog:
                            "Fill them in on the Notifications tab, or untick "
                            "'Send Telegram alerts'.", parent=self.win)
             return
+        exec_paths = self._exec_paths()
+        if self.exec_enabled.get() and not any(exec_paths.values()):
+            messagebox.showwarning(
+                APP_TITLE, "Running programs needs at least one program.\n"
+                           "Fill one in on the Executions tab, or untick "
+                           "'Run programs on these events'.", parent=self.win)
+            return
         self.app.cfg = {
             "access_key": access,
             "secret_key": secret,
@@ -1251,7 +1584,15 @@ class SettingsDialog:
             "restore_delay_min": self._num(self.sp_restore, DEFAULT_RESTORE_DELAY_MIN, 0, 180),
             "batt_alert_1": int(self._num(self.sp_batt1, DEFAULT_BATT_ALERT_1, 0, 100)),
             "batt_alert_2": int(self._num(self.sp_batt2, DEFAULT_BATT_ALERT_2, 0, 100)),
+            "exec_enabled": bool(self.exec_enabled.get()),
+            "exec_outage_delay_min": self._num(
+                self.sp_exec_outage, DEFAULT_EXEC_OUTAGE_DELAY_MIN, 0, 180),
+            "exec_restore_delay_min": self._num(
+                self.sp_exec_restore, DEFAULT_EXEC_RESTORE_DELAY_MIN, 0, 180),
         }
+        for kind in EXEC_KINDS:
+            self.app.cfg[f"exec_{kind}_path"] = exec_paths[kind]
+            self.app.cfg[f"exec_{kind}_args"] = self.exec_w[kind]["args"].get().strip()
         save_config(self.app.cfg)
         try:
             set_autostart(self.autostart_var.get())
@@ -1446,9 +1787,10 @@ class App:
                 # arrive far less often than bmsStatus (a few per minute on a
                 # DELTA 2 Max). A live MQTT feed therefore doesn't prove the
                 # outage signal is current, so fall back to HTTP for it while
-                # alerts are on - but only if it really has gone quiet.
+                # alerts or executions are on - but only if it really has gone
+                # quiet.
                 grid_fresh = (time.time() - self.last_grid_live) < max(120, 2 * refresh)
-                need_grid = bool(self.cfg.get("telegram_enabled")) and not grid_fresh
+                need_grid = watching_grid(self.cfg) and not grid_fresh
                 force, self.force_http = self.force_http, False
                 # HTTP is a stale snapshot; use it only to seed, as a fallback
                 # when MQTT is silent, or when the user hits "Refresh now".
@@ -1489,6 +1831,9 @@ def cmd_selftest():
     make_app_icon()
     render_icon(54, False)
     render_icon(None, False)
+    # malformed on purpose: substitution must never raise, whatever is typed
+    render_args("--soc {soc} {typo} { {} 50%",
+                exec_values("outage", None, "EcoFlow", time.time()))
     root = tk.Tk()
     root.withdraw()
     root.destroy()
