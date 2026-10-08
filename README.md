@@ -18,6 +18,7 @@ EcoFlow Tray keeps your battery percentage in the notification area and refreshe
 It was written against a DELTA 2 Max and works with any device the Developer API exposes.
 
 - A live tray icon, colored by charge: green at 60% and above, amber from 30, orange from 15, red below that, and cyan while charging.
+- A flyout on left click with the charge, the power going in and out, the time left and the state of the live feed, in the taskbar's light or dark theme.
 - Values pushed over MQTT, the same stream the mobile app listens to.
 - Telegram alerts for grid outages and for two battery levels, sent through a bot you create yourself.
 - Local programs launched on those same four events, each on its own delay.
@@ -42,6 +43,17 @@ The latest `EcoFlowTray.exe` is on the [releases page](../../releases). There is
 2. Run `EcoFlowTray.exe`. Settings opens by itself the first time.
 3. Enter both keys, choose your **Region** (Global or Europe), click **Test & load devices** and pick your device.
 4. Choose the battery reading that matches your app, set the refresh interval, and save.
+
+## The tray icon
+
+The icon shows the charge as a number, in the colors listed above. Hover over it for a short summary, or left-click it for a larger panel: the charge, whether the unit is charging or discharging and how long it has left, the power going in and out, and whether the live feed is connected. The panel follows the taskbar's light or dark theme and closes when you click anywhere else or press Esc.
+
+Right-click the icon for **Refresh now**, **Settings** and **Quit**.
+
+<p align="center">
+  <img src="docs/screenshot-flyout-light.png" width="320" alt="The flyout in the light theme: 54%, discharging with 3 h 07 min left, 132 W going out">
+  <img src="docs/screenshot-flyout-dark.png" width="320" alt="The flyout in the dark theme: 87%, charging with 23 min to full, 1180 W coming in">
+</p>
 
 ## The battery reading
 
