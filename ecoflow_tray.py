@@ -24,6 +24,7 @@ Modes:
 
 import base64
 import ctypes
+import functools
 import hashlib
 import hmac
 import html
@@ -47,7 +48,7 @@ from tkinter import filedialog, messagebox, ttk
 
 import paho.mqtt.client as mqtt
 import pystray
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 APP_NAME = "EcoFlowTray"
 APP_TITLE = "EcoFlow Tray"
@@ -962,6 +963,201 @@ def tooltip_for(reading):
     )
 
 
+# --------------------------------------------------------------------------- #
+# Details panel (left click): a Windows 11 style flyout drawn with Pillow
+# --------------------------------------------------------------------------- #
+PANEL_THEMES = {  # Windows 11 flyout surfaces; picked from the taskbar theme
+    "light": {"surface": "#f9f9f9", "band": "#eeeeee", "line": "#e3e3e3", "text": "#1b1b1b",
+              "text2": "#5c5c5c", "text3": "#6b6b6b", "on_fill": "#1b1b1b"},
+    "dark": {"surface": "#2b2b2b", "band": "#202020", "line": "#3a3a3a", "text": "#ffffff",
+             "text2": "#d1d1d1", "text3": "#a0a0a0", "on_fill": "#1b1b1b"},
+}
+_GLYPH_IN, _GLYPH_OUT, _GLYPH_BOLT = "\ue896", "\ue898", "\ue945"  # Segoe Fluent/MDL2
+
+
+@functools.lru_cache(maxsize=None)
+def _ui_font(size, style="Regular Text"):
+    """Segoe UI Variable at a named instance, falling back to classic Segoe UI."""
+    try:
+        font = ImageFont.truetype("C:/Windows/Fonts/SegUIVar.ttf", size)
+        font.set_variation_by_name(style)
+        return font
+    except (OSError, ValueError):
+        name = "seguisb.ttf" if style.startswith("Semibold") else "segoeui.ttf"
+        try:
+            return ImageFont.truetype(f"C:/Windows/Fonts/{name}", size)
+        except OSError:
+            return _font(size)
+
+
+@functools.lru_cache(maxsize=None)
+def _icon_font(size):
+    for name in ("SegoeIcons.ttf", "segmdl2.ttf"):  # Windows 11, then 10
+        try:
+            return ImageFont.truetype(f"C:/Windows/Fonts/{name}", size)
+        except OSError:
+            continue
+    return None
+
+
+def system_theme():
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as key:
+            light = winreg.QueryValueEx(key, "SystemUsesLightTheme")[0]
+    except OSError:
+        light = 0
+    return "light" if light else "dark"
+
+
+def _clip(draw, text, font, width):
+    """Shorten text with an ellipsis until it fits in `width` pixels."""
+    if draw.textlength(text, font=font) <= width:
+        return text
+    while text and draw.textlength(text + "…", font=font) > width:
+        text = text[:-1]
+    return text.rstrip() + "…"
+
+
+def _wrap(draw, text, font, width, max_lines=3):
+    """Break at spaces, or mid-word when one word is wider than the line
+    (error text is full of URLs and reprs)."""
+    lines, text = [], " ".join(text.split())
+    while text and len(lines) < max_lines:
+        n = len(text)
+        while n > 1 and draw.textlength(text[:n], font=font) > width:
+            n -= 1
+        cut = n if n == len(text) else text.rfind(" ", 0, n + 1)
+        cut = cut if cut > 0 else n
+        lines.append(text[:cut].strip())
+        text = text[cut:].lstrip()
+    if text:
+        lines[-1] = _clip(draw, f"{lines[-1]} {text}", font, width)
+    return lines
+
+
+def _fmt_span(minutes):
+    h, m = divmod(minutes, 60)
+    return f"{h} h {m:02d} min" if h else f"{m} min"
+
+
+def render_details(reading, source, device, note="", theme="light"):
+    """Draw the left-click panel. `reading` is None while there is no data,
+    and `note` then says why (an error, or that the first reading is due)."""
+    c = PANEL_THEMES[theme]
+    W, P, S = 320, 20, 4  # width, gutter, supersampling for the shapes
+    bx0, by0, bx1, by1 = P, P, W - P - 7, P + 72      # battery body
+    ix0, iy0, ix1, iy1 = bx0 + 5, by0 + 5, bx1 - 5, by1 - 5  # fill well
+    probe = ImageDraw.Draw(Image.new("L", (1, 1)))
+    msg_font = _ui_font(14)
+    msg_lines = [] if reading else _wrap(probe, note, msg_font, W - 2 * P)
+    body_bottom = 196 if reading else by1 + 26 + 20 * len(msg_lines)
+    H = body_bottom + 20 + 40  # gap, footer band
+
+    img = Image.new("RGB", (W, H), c["surface"])
+    d = ImageDraw.Draw(img)
+
+    # Battery shell and level fill, supersampled so the curves stay smooth.
+    shell = Image.new("L", (W * S, H * S), 0)
+    ds = ImageDraw.Draw(shell)
+    ds.rounded_rectangle([bx0 * S, by0 * S, bx1 * S, by1 * S], radius=12 * S, outline=255, width=2 * S)
+    mid = (by0 + by1) // 2
+    ds.rounded_rectangle([(bx1 + 2) * S, (mid - 10) * S, (bx1 + 6) * S, (mid + 10) * S], radius=2 * S, fill=255)
+    fill = Image.new("L", (W * S, H * S), 0)
+    soc = reading["soc"] if reading else 0
+    if soc > 0:
+        ImageDraw.Draw(fill).rounded_rectangle([ix0 * S, iy0 * S, ix1 * S, iy1 * S], radius=8 * S, fill=255)
+        cut = ix0 + (ix1 - ix0) * min(soc, 100) / 100
+        ImageDraw.Draw(fill).rectangle([cut * S, 0, W * S, H * S], fill=0)
+    shell, fill = (m.resize((W, H), Image.LANCZOS) for m in (shell, fill))
+    img.paste(c["text2"], mask=shell)
+    if reading:
+        img.paste(_color_for(soc, reading["charging"])[:3], mask=fill)
+
+    # The percentage sits inside the battery and flips colour where the
+    # fill runs under it, so it reads on both the fill and the empty well.
+    ink = Image.new("L", (W, H), 0)
+    di = ImageDraw.Draw(ink)
+    base = mid + 14
+    big = _ui_font(40, "Semibold Display")
+    num = str(soc) if reading else "—"
+    di.text((ix0 + 14, base), num, font=big, fill=255, anchor="ls")
+    if reading:
+        di.text((ix0 + 16 + di.textlength(num, font=big), base), "%",
+                font=_ui_font(22, "Semibold Display"), fill=255, anchor="ls")
+        if reading["charging"] and _icon_font(22):
+            di.text((ix1 - 14, mid), _GLYPH_BOLT, font=_icon_font(22), fill=255, anchor="rm")
+    img.paste(c["text"] if reading else c["text3"], mask=ink)
+    img.paste(c["on_fill"], mask=ImageChops.multiply(ink, fill))
+
+    if reading:
+        # State and time, then the two power flows.
+        y = by1 + 30
+        state_font = _ui_font(14, "Semibold Text")
+        d.text((P, y), reading["state"], font=state_font, fill=c["text"], anchor="ls")
+        if reading["remain_min"] is not None:
+            span = _fmt_span(reading["remain_min"])
+            tail = f"  ·  {span} to full" if reading["charging"] else f"  ·  {span} left"
+            d.text((P + d.textlength(reading["state"], font=state_font), y), tail,
+                   font=msg_font, fill=c["text2"], anchor="ls")
+        for col, (glyph, label, watts) in enumerate(
+                ((_GLYPH_IN, "Input", reading["watts_in"]), (_GLYPH_OUT, "Output", reading["watts_out"]))):
+            x = P + col * (W - 2 * P) // 2
+            if _icon_font(14):
+                d.text((x, 158), glyph, font=_icon_font(14), fill=c["text2"], anchor="lm")
+            d.text((x + 22, 158), label, font=_ui_font(12), fill=c["text2"], anchor="lm")
+            d.text((x, 190), f"{watts} W", font=_ui_font(22, "Semibold Display"),
+                   fill=c["text"] if watts else c["text3"], anchor="ls")
+    else:
+        for i, line in enumerate(msg_lines):
+            d.text((P, by1 + 30 + 20 * i), line, font=msg_font, fill=c["text2"], anchor="ls")
+
+    # Footer band: where the numbers come from, and which unit this is.
+    top = H - 40
+    d.rectangle([0, top, W, H], fill=c["band"])
+    d.line([0, top, W, top], fill=c["line"])
+    source = source or "Connecting…"
+    dot = (_color_for(100, False) if source.startswith("Live")
+           else (255, 179, 0) if source.startswith("Connect") else (244, 67, 54))
+    d.ellipse([P, top + 16, P + 8, top + 24], fill=dot[:3])
+    small = _ui_font(12)
+    d.text((P + 16, top + 20), _clip(d, source, small, 150), font=small, fill=c["text2"], anchor="lm")
+    if device:
+        d.text((W - P, top + 20), _clip(d, device, small, 110), font=small, fill=c["text3"], anchor="rm")
+    return img
+
+
+def _photo(img):
+    """PIL image -> Tk PhotoImage via PNG, so Pillow's ImageTk isn't needed."""
+    import io
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return tk.PhotoImage(data=base64.b64encode(buf.getvalue()))
+
+
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+
+def work_area(x, y):
+    """Desktop minus taskbar on the monitor under (x, y)."""
+    user32 = ctypes.windll.user32
+    user32.MonitorFromPoint.restype = wintypes.HMONITOR
+    user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+    info = _MONITORINFO(cbSize=ctypes.sizeof(_MONITORINFO))
+    mon = user32.MonitorFromPoint(wintypes.POINT(x, y), 2)  # MONITOR_DEFAULTTONEAREST
+    user32.GetMonitorInfoW(mon, ctypes.byref(info))
+    r = info.rcWork
+    return r.left, r.top, r.right, r.bottom
+
+
+def animations_enabled():
+    flag = wintypes.BOOL(True)
+    ctypes.windll.user32.SystemParametersInfoW(0x1042, 0, ctypes.byref(flag), 0)  # SPI_GETCLIENTAREAANIMATION
+    return bool(flag.value)
+
+
 def make_app_icon():
     """Return a battery-style app icon (used for the .ico and window icon)."""
     s = 256
@@ -1620,6 +1816,10 @@ class App:
         self.ui_queue = queue.Queue()
         self.state = {"soc": "--", "detail": "Not configured", "source": "", "alerts": ""}
         self.settings_win = None
+        self.details_win = None
+        self._details_closed = 0.0  # when the details panel last closed
+        self.reading = None          # last reading, for the details panel
+        self.note = "Waiting for the first reading…"  # why there is none
         self.alerter = Alerter(lambda: self.cfg, self._on_alert_status)
 
         # Shared merged quota state, fed by HTTP (seed) and MQTT (live updates).
@@ -1647,21 +1847,16 @@ class App:
                 pystray.MenuItem(lambda i: self.state.get("alerts"), None, enabled=False,
                                  visible=lambda i: bool(self.state.get("alerts"))),
                 pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Details", self._on_details, default=True),  # left click
                 pystray.MenuItem("Refresh now", self._on_refresh),
-                pystray.MenuItem("Settings...", self._on_settings, default=True),
+                pystray.MenuItem("Settings...", self._on_settings),
                 pystray.MenuItem("Quit", self._on_quit),
             ),
         )
 
     def _tk_photo_icon(self):
         try:
-            img = make_app_icon().resize((64, 64), Image.LANCZOS)
-            photo = tk.PhotoImage(width=64, height=64)
-            # Build a base64 PPM so PhotoImage can load it without a temp file.
-            import io
-            buf = io.BytesIO()
-            img.convert("RGB").save(buf, format="PNG")
-            return tk.PhotoImage(data=base64.b64encode(buf.getvalue()))
+            return _photo(make_app_icon().resize((64, 64), Image.LANCZOS).convert("RGB"))
         except Exception:
             return None
 
@@ -1681,6 +1876,9 @@ class App:
     # -- menu callbacks (run on the pystray thread) ----------------------- #
     def _on_settings(self, icon=None, item=None):
         self.post(self.open_settings)
+
+    def _on_details(self, icon=None, item=None):
+        self.post(self.toggle_details)
 
     def _on_refresh(self, icon, item):
         self.force_http = True
@@ -1706,6 +1904,75 @@ class App:
                 self.settings_win = None
         SettingsDialog(self)
 
+    # -- details panel: what the tooltip says, as a flyout, on left click - #
+    def toggle_details(self):
+        if self.details_win is not None:
+            self._close_details()
+            return
+        # Clicking the tray icon while the panel is open first takes focus
+        # away (closing it), then delivers the click; don't reopen on that.
+        if time.time() - self._details_closed < 0.4:
+            return
+        if not is_configured(self.cfg):
+            self.open_settings()  # nothing to show yet
+            return
+        win = self.details_win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        self._details_label = tk.Label(win, bd=0, highlightthickness=0)
+        self._details_label.pack()
+        self._details_key = None
+        self._refresh_details(win)
+
+        # Flyout spot: 12px clear of the taskbar, centred on the icon, kept
+        # inside the work area of whichever monitor holds the tray.
+        win.update_idletasks()
+        px, py = win.winfo_pointerxy()
+        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        left, top, right, bottom = work_area(px, py)
+        x = min(max(px - w // 2, left + 12), right - w - 12)
+        y = min(max(py - h - 12, top + 12), bottom - h - 12)
+        try:  # Windows 11 rounds the corners and adds the hairline border
+            pref = ctypes.c_int(2)  # DWMWCP_ROUND
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                int(win.wm_frame(), 16), 33, ctypes.byref(pref), 4)  # DWMWA_WINDOW_CORNER_PREFERENCE
+        except Exception:
+            pass
+
+        win.bind("<FocusOut>", lambda e: e.widget is win and self._close_details())
+        win.bind("<Escape>", lambda e: self._close_details())
+        win.bind("<Button>", lambda e: self._close_details())
+        win.focus_force()
+        rise = 12 if py >= bottom else -12 if py < top else 0  # slide away from the taskbar
+        self._slide_in(win, x, y, rise if animations_enabled() else 0)
+
+    def _slide_in(self, win, x, y, rise, step=0):
+        steps = 10  # ~170 ms, exponential-style ease-out
+        if win is not self.details_win:
+            return
+        ease = 1 - (1 - step / steps) ** 3 if rise else 1
+        win.attributes("-alpha", ease)
+        win.geometry(f"+{x}+{y + round(rise * (1 - ease))}")
+        if ease < 1:
+            win.after(16, self._slide_in, win, x, y, rise, step + 1)
+
+    def _refresh_details(self, win):
+        if win is not self.details_win:  # closed (or replaced) since
+            return
+        args = (self.reading, self.state.get("source"), self.cfg.get("device_name", ""),
+                self.note, system_theme())
+        if args != self._details_key:  # redraw only when something changed
+            self._details_key = args
+            self._details_photo = _photo(render_details(*args))  # keep a ref for Tk
+            self._details_label.config(image=self._details_photo)
+        win.after(1000, self._refresh_details, win)
+
+    def _close_details(self):
+        win, self.details_win = self.details_win, None
+        self._details_closed = time.time()
+        if win is not None:
+            win.destroy()
+
     # -- icon/state updates ---------------------------------------------- #
     def _apply(self, reading):
         src = self.state.get("source")
@@ -1714,6 +1981,7 @@ class App:
             self.icon.icon = render_icon(reading["soc"], reading["charging"])
             self._last_icon_key = key
         self.icon.title = tooltip_for(reading) + (f"\n{src}" if src else "")
+        self.reading = reading
         self.state["soc"] = reading["soc"]
         self.state["detail"] = (
             f"{reading['state']} - In {reading['watts_in']}W / Out {reading['watts_out']}W"
@@ -1724,6 +1992,7 @@ class App:
         self.icon.icon = render_icon(None, False)
         self._last_icon_key = None
         self.icon.title = tooltip
+        self.reading, self.note = None, detail
         self.state["soc"] = soc_text
         self.state["detail"] = detail
         self.icon.update_menu()
@@ -1831,6 +2100,10 @@ def cmd_selftest():
     make_app_icon()
     render_icon(54, False)
     render_icon(None, False)
+    for theme in PANEL_THEMES:
+        render_details({"soc": 54, "state": "Charging", "charging": True, "watts_in": 900,
+                        "watts_out": 40, "remain_min": 75}, "Live (MQTT)", "DELTA 2 Max", theme=theme)
+        render_details(None, "", "", note="Error: " + "x" * 300, theme=theme)
     # malformed on purpose: substitution must never raise, whatever is typed
     render_args("--soc {soc} {typo} { {} 50%",
                 exec_values("outage", None, "EcoFlow", time.time()))
