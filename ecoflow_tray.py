@@ -63,6 +63,7 @@ DEFAULT_HOST = HOSTS["Global (api.ecoflow.com)"]
 DEFAULT_SOC_FIELD = "bms_emsStatus.f32LcdShowSoc"
 CUSTOM_SOC_LABEL = "Custom field…"
 DEFAULT_REFRESH = 60
+MQTT_QUIET_SECONDS = 60  # MQTT silence that marks the live feed as stalled
 UNKNOWN_TIME = 5999  # EcoFlow sentinel for "no estimate available"
 
 # Grid (AC input) watch + Telegram alerts
@@ -1827,6 +1828,8 @@ class App:
         self.quota_lock = threading.Lock()
         self.mqtt = None
         self.last_live = 0.0     # time of last MQTT message
+        self.mqtt_started = 0.0  # time the current MQTT session was opened
+        self.mqtt_backoff = 1    # doubles per revival that brought no data
         self.last_grid_live = 0.0  # time the AC-input field last arrived over MQTT
         self.force_http = False  # set by "Refresh now"
         self._last_icon_key = None  # (soc, charging) last rendered
@@ -2013,6 +2016,7 @@ class App:
     # -- MQTT callbacks (run on the paho thread) ------------------------- #
     def _on_mqtt_update(self, fields):
         self.last_live = time.time()
+        self.mqtt_backoff = 1
         if self.cfg.get("grid_field", DEFAULT_GRID_FIELD) in fields:
             self.last_grid_live = time.time()
         self._merge_and_apply(fields)
@@ -2030,10 +2034,22 @@ class App:
             self.mqtt.stop()
             self.mqtt = None
         self.last_live = 0.0
+        self.mqtt_started = time.time()
         if is_configured(self.cfg):
             self.state["source"] = "Connecting…"
             self.mqtt = EcoflowMqtt(dict(self.cfg), self._on_mqtt_update, self._on_mqtt_status)
             self.mqtt.start()
+
+    def _revive_mqtt(self, now):
+        # A stalled feed keeps its socket up, so only a new session revives it.
+        quiet = now - max(self.last_live, self.mqtt_started)
+        if self.mqtt and quiet > MQTT_QUIET_SECONDS * self.mqtt_backoff:
+            self.mqtt_backoff = min(self.mqtt_backoff * 2, 16)
+            self.start_mqtt()
+
+    def _watchdog(self):
+        while not self.stop_event.wait(10):
+            self._revive_mqtt(time.time())
 
     def apply_new_config(self):
         with self.quota_lock:
@@ -2081,6 +2097,7 @@ class App:
         # update is applied to a live icon (not lost).
         icon.visible = True
         threading.Thread(target=self._worker, daemon=True).start()
+        threading.Thread(target=self._watchdog, daemon=True).start()
         self.alerter.start()
         if is_configured(self.cfg):
             self.start_mqtt()

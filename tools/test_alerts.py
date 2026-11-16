@@ -448,8 +448,35 @@ def test_config_roundtrip():
     check("exec defaults fill in", back["exec_batt1_path"], "")
 
 
+def test_mqtt_watchdog():
+    section("MQTT watchdog")
+    app, starts = et.App.__new__(et.App), []
+    app.start_mqtt = lambda: starts.append(1)
+    app._merge_and_apply = lambda fields: None
+    app.cfg, app.mqtt = {}, object()
+    quiet = et.MQTT_QUIET_SECONDS
+    app.last_live, app.mqtt_started, app.mqtt_backoff = 1000.0, 900.0, 1
+    app._revive_mqtt(1000.0 + quiet - 1)
+    check("fresh feed is left alone", len(starts), 0)
+    app._revive_mqtt(1000.0 + quiet + 1)
+    check("silent feed gets a new session", (len(starts), app.mqtt_backoff), (1, 2))
+    app.mqtt_started = 2000.0
+    app._revive_mqtt(2000.0 + 2 * quiet - 1)
+    check("a failed revival waits twice as long", len(starts), 1)
+    app._revive_mqtt(2000.0 + 2 * quiet + 1)
+    check("then it retries", (len(starts), app.mqtt_backoff), (2, 4))
+    app.mqtt_backoff = 16
+    app._revive_mqtt(99999.0)
+    check("backoff is capped", app.mqtt_backoff, 16)
+    app._on_mqtt_update({})
+    check("a message resets the backoff", app.mqtt_backoff, 1)
+    app.mqtt = None
+    app._revive_mqtt(999999.0)
+    check("nothing to revive before MQTT starts", len(starts), 3)
+
+
 def main():
-    for test in (test_field_detection, test_outage_debounce, test_zero_delay,
+    for test in (test_mqtt_watchdog, test_field_detection, test_outage_debounce, test_zero_delay,
                  test_tick_ages_out, test_battery_levels, test_gating,
                  test_exec_independent_delay, test_exec_flicker_independent,
                  test_exec_disabled, test_exec_empty_path, test_exec_battery_slots,
