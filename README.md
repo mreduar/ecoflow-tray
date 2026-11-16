@@ -68,7 +68,7 @@ The two can disagree by a wide margin, so the app does not guess. After you pick
 
 ## How updates work
 
-The HTTP endpoint (`quota/all`) returns a cached snapshot that only refreshes while a session is active, which is why polling it alone leaves the number frozen until you open the phone app. EcoFlow Tray subscribes to the MQTT stream instead, the one the app itself uses, so the device pushes its own updates. HTTP is kept for the first reading and as a fallback when MQTT falls silent. **Refresh every (seconds)** governs that fallback, not the live feed.
+The HTTP endpoint (`quota/all`) returns a cached snapshot that only refreshes while a session is active, which is why polling it alone leaves the number frozen until you open the phone app. EcoFlow Tray subscribes to the MQTT stream instead, the one the app itself uses, so the device pushes its own updates. HTTP is kept for the first reading and as a fallback when MQTT falls silent. EcoFlow's cloud can stop the stream while the connection stays up, usually right after the phone app closes, so after 60 seconds of silence the tray opens a new session. **Refresh every (seconds)** governs that fallback, not the live feed.
 
 ## Telegram alerts
 
